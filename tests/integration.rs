@@ -422,6 +422,22 @@ async fn a_client_idle_in_a_transaction_gives_up_its_connection() {
 }
 
 #[tokio::test]
+async fn sessions_are_read_only_on_a_writer_too() {
+    require_pg!();
+    // The test server is a primary, like a reader endpoint that fell back to the writer.
+    let lokaj = Lokaj::with(|c| c.pool.max_size = 1).await;
+    let alice = tenant().await;
+    let mut a = lokaj.login(&alice).await;
+    let error = a
+        .query("create temp table t as select 'secret of a' s")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "25006");
+    let mut b = lokaj.login(&alice).await;
+    assert_eq!(b.query("select s from t").await.unwrap_err().code, "42P01");
+}
+
+#[tokio::test]
 async fn unnamed_statements_do_not_leak_between_clients() {
     require_pg!();
     let lokaj = Lokaj::with(|c| c.pool.max_size = 1).await;

@@ -212,6 +212,9 @@ impl ServerConn {
             ("database", database),
             ("application_name", &settings.application_name),
             ("client_encoding", "UTF8"),
+            // A reader endpoint may fall back to the writer: keep sessions read-only there too,
+            // or a write or a temporary table could outlive the client that made it.
+            ("default_transaction_read_only", "on"),
         ];
         params.extend(options.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         let mut out = BytesMut::new();

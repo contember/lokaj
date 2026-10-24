@@ -117,6 +117,11 @@ It refuses:
 - `RESET`, `DISCARD`, `PREPARE` and `LISTEN`;
 - `DECLARE … WITH HOLD`.
 
+**Read-only sessions.** Server connections start with `default_transaction_read_only = on`,
+so writes and temporary tables fail with `25006` even when the reader endpoint falls back to
+the writer. This guards against accidents only: a client can still begin a `READ WRITE`
+transaction. Give the roles read-only privileges for a hard boundary.
+
 **Server output.** Results stream to the client without being buffered. lokaj parses only
 `ReadyForQuery`, `ParameterStatus` and `ErrorResponse`.
 
