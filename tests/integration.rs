@@ -464,6 +464,32 @@ async fn a_client_idle_in_a_transaction_gives_up_its_connection() {
 }
 
 #[tokio::test]
+async fn a_client_that_stops_reading_gives_up_its_connection() {
+    require_pg!();
+    let lokaj = Lokaj::with(|c| {
+        c.pool.max_size = 1;
+        c.client.idle_transaction_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let alice = tenant().await;
+    let mut stalled = lokaj.login(&alice).await;
+    // Far more than the socket buffers and lokaj's output buffer hold; never read.
+    stalled
+        .send(&query(
+            "select repeat('x', 1000000) from generate_series(1, 50)",
+        ))
+        .await;
+    let mut other = lokaj.login(&alice).await;
+    assert_eq!(other.query_one("select 1").await, "1");
+    assert_eq!(
+        lokaj
+            .metric("lokaj_server_recycles_total{reason=\"client_stalled\"}")
+            .await,
+        1.0
+    );
+}
+
+#[tokio::test]
 async fn sessions_are_read_only_on_a_writer_too() {
     require_pg!();
     // The test server is a primary, like a reader endpoint that fell back to the writer.

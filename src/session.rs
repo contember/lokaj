@@ -506,6 +506,7 @@ enum Event {
     ServerSent(std::io::Result<Sent>),
     Drain,
     IdleTimeout,
+    ClientStalled,
 }
 
 enum Sent {
@@ -551,7 +552,7 @@ impl Session {
         let mut assigned = None;
         let end = self.relay_loop(&mut assigned).await;
         if let Some(assigned) = assigned {
-            self.abort(assigned);
+            self.abort(assigned, "client_aborted");
         }
         if let End::Fatal = end {
             let flush = async {
@@ -564,7 +565,7 @@ impl Session {
 
     /// Gives up a connection whose client is gone or misbehaved: cancels any running query and
     /// closes the connection, so the server rolls back.
-    fn abort(&mut self, assigned: Assigned) {
+    fn abort(&mut self, assigned: Assigned, reason: &'static str) {
         let cancelled = self.cancel.detach();
         if assigned.relay.in_flight() && !cancelled {
             let key = assigned.lease.conn().cancel_key().clone();
@@ -581,7 +582,7 @@ impl Session {
                 }
             });
         }
-        self.app.metrics.recycle("client_aborted");
+        self.app.metrics.recycle(reason);
         drop(assigned);
     }
 
@@ -724,6 +725,8 @@ impl Session {
                 Some(a) => {
                     let awaits_client =
                         a.relay.awaits_client() && a.to_server.is_empty() && !a.server_unflushed;
+                    // Output the client does not read holds the server connection just as well.
+                    let client_stalled = !self.to_client.is_empty() || self.client_unflushed;
                     let conn = a.lease.conn_mut();
                     conn.buf.reserve(32 << 10);
                     let (mut server_rd, mut server_wr) = tokio::io::split(&mut conn.stream);
@@ -732,7 +735,9 @@ impl Session {
                         sent = send_queued(&mut self.writer, &self.to_client), if !self.to_client.is_empty() || self.client_unflushed => Event::ClientSent(sent),
                         sent = send_queued(&mut server_wr, &a.to_server), if !a.to_server.is_empty() || a.server_unflushed => Event::ServerSent(sent),
                         read = self.reader.read_buf(&mut self.cli_in), if a.to_server.len() < HIGH_WATER && self.cli_in.len() < max_message => Event::ClientRead(read),
-                        () = tokio::time::sleep_until(self.active_at + idle_timeout), if awaits_client => Event::IdleTimeout,
+                        () = tokio::time::sleep_until(self.active_at + idle_timeout), if awaits_client || client_stalled => {
+                            if client_stalled { Event::ClientStalled } else { Event::IdleTimeout }
+                        }
                     }
                 }
                 None => {
@@ -749,7 +754,7 @@ impl Session {
                 }
             };
 
-            if !matches!(event, Event::IdleTimeout) {
+            if !matches!(event, Event::IdleTimeout | Event::ClientStalled) {
                 self.active_at = Instant::now();
             }
             match event {
@@ -833,6 +838,16 @@ impl Session {
                     self.queue_fatal(&fatal(
                         "25P03",
                         "lokaj: terminating connection due to idle-in-transaction timeout",
+                    ));
+                    return End::Fatal;
+                }
+                Event::ClientStalled => {
+                    if let Some(stalled) = assigned.take() {
+                        self.abort(stalled, "client_stalled");
+                    }
+                    self.queue_fatal(&fatal(
+                        "08006",
+                        "lokaj: terminating connection because the client stopped reading",
                     ));
                     return End::Fatal;
                 }

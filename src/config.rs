@@ -168,7 +168,7 @@ pub struct ClientConfig {
     #[serde(default = "defaults::max_message_size")]
     pub max_message_size: usize,
     /// How long a client may hold a server connection while the server waits for it: idle in
-    /// a transaction or in an unfinished extended-protocol batch.
+    /// a transaction or in an unfinished extended-protocol batch, or not reading the results.
     #[serde(
         default = "defaults::idle_transaction_timeout",
         with = "humantime_serde"

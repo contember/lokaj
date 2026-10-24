@@ -98,6 +98,8 @@ Passwords and authentication messages are never logged.
 - A client that holds a connection while the server waits for it, idle in a transaction or in
   an unfinished extended batch, is closed with `FATAL 25P03` after
   `client.idle_transaction_timeout`, and the connection is discarded.
+- A client that stops reading results is closed with `FATAL 08006` once nothing moved for
+  `client.idle_transaction_timeout`; its query is cancelled and the connection discarded.
 
 **Allowed messages:**
 - simple `Query`;
