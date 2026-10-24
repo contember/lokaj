@@ -220,14 +220,17 @@ describe('pooling', () => {
 		try {
 			const sessions = async () =>
 				(await root.query('select count(*)::int as n from pg_stat_activity where usename = $1', [tenant.user])).rows[0].n
-			await Promise.all(
-				Array.from({ length: 200 }, async () => {
-					const client = new pg.Client(lokajConfig(tenant))
-					await client.connect()
-					await client.query('select 1')
-					await client.end()
-				}),
-			)
+			// Waves stay under pool.max_waiters (100), past which lokaj refuses the query.
+			for (let wave = 0; wave < 4; wave++) {
+				await Promise.all(
+					Array.from({ length: 50 }, async () => {
+						const client = new pg.Client(lokajConfig(tenant))
+						await client.connect()
+						await client.query('select 1')
+						await client.end()
+					}),
+				)
+			}
 			assert.ok((await sessions()) <= 5)
 			const counted = await root.query('select sessions from pg_stat_database where datname = $1', [tenant.database])
 			assert.ok(counted.rows[0].sessions <= 5 + 2, `server sessions: ${counted.rows[0].sessions}`)
