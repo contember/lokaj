@@ -15,10 +15,10 @@ use zeroize::Zeroizing;
 use crate::app::App;
 use crate::auth::{AuthError, CredKey, Login, Verification};
 use crate::cancel::CancelHandle;
-use crate::metrics::PoolLabels;
+use crate::metrics::{PoolLabels, WaitSource};
 use crate::pool::{AcquireError, Lease, PoolHandle, PoolKey, TooManyVariants};
 use crate::protocol::{self, FrontendMessage, Severity, StartupPacket, TxStatus};
-use crate::relay::{BackendStream, Flow, FrontendAction, Relay, ServerViolation};
+use crate::relay::{BackendStream, Flow, FrontendAction, Rejected, Relay, ServerViolation};
 use crate::scram::Secret;
 use crate::server::{self, ConnectError, Connected, ServerConn};
 use crate::upstream::Upstream;
@@ -68,6 +68,14 @@ fn connect_failure(error: &ConnectError) -> Fatal {
         }
         error if error.is_auth_failure() => fatal("28P01", "lokaj: password authentication failed"),
         _ => fatal("08006", "lokaj: could not connect to the server"),
+    }
+}
+
+fn acquire_reason(error: &AcquireError<ConnectError>) -> &'static str {
+    match error {
+        AcquireError::TimedOut => "wait_timeout",
+        AcquireError::TooManyWaiters => "too_many_waiters",
+        AcquireError::Open(_) => "connect_failed",
     }
 }
 
@@ -384,8 +392,9 @@ async fn login(
     if let Some(mut conn) = verified {
         pool.data.observe(&mut conn);
         // Without a free slot the verification connection is simply closed.
-        if let Some(lease) = pool.try_adopt(conn) {
-            lease.release();
+        match pool.try_adopt(conn) {
+            Some(lease) => lease.release(),
+            None => app.metrics.recycle("not_adopted"),
         }
     }
     let deadline = Instant::now() + wait_timeout;
@@ -397,6 +406,7 @@ async fn login(
             match pool.acquire(deadline).await {
                 Ok(lease) => lease.release(),
                 Err(error) => {
+                    app.metrics.session_error(acquire_reason(&error));
                     send_fatal(&mut client, &acquire_failure(&error)).await;
                     return Ok(None);
                 }
@@ -544,6 +554,25 @@ impl Session {
         );
     }
 
+    /// Ends the session with `error`, counted under `reason`.
+    fn fail(&mut self, reason: &'static str, error: &Fatal) -> End {
+        self.app.metrics.session_error(reason);
+        self.queue_fatal(error);
+        End::Fatal
+    }
+
+    /// Ends the session over a message lokaj refuses, logged with the tenant: it points at the
+    /// application that sent it.
+    fn refuse(&mut self, rejected: Rejected) -> End {
+        tracing::info!(user = %self.labels.user, database = %self.labels.database, code = rejected.code, message = %rejected.message, "client message refused");
+        let reason = if rejected.code == "0A000" {
+            "unsupported"
+        } else {
+            "protocol"
+        };
+        self.fail(reason, &fatal(rejected.code, rejected.message))
+    }
+
     fn read_limit(&self) -> usize {
         self.app.config.client.max_message_size + 5
     }
@@ -653,12 +682,17 @@ impl Session {
                 },
             }
         };
+        let lease = result.map_err(|error| {
+            self.app.metrics.session_error(acquire_reason(&error));
+            acquire_failure(&error)
+        })?;
         self.app
             .metrics
             .pool_wait
-            .get_or_create(&self.labels)
+            .get_or_create(&WaitSource {
+                source: lease.source.as_str(),
+            })
             .observe(started.elapsed().as_secs_f64());
-        let lease = result.map_err(|error| acquire_failure(&error))?;
         self.cancel.attach(lease.conn().cancel_key().clone());
         Ok(Some(Assigned {
             lease,
@@ -676,16 +710,14 @@ impl Session {
             while let Some((msg_tag, len)) = match protocol::frame_at(&self.cli_in, max_message) {
                 Ok(frame) => frame,
                 Err(error) => {
-                    self.queue_fatal(&fatal("08P01", format!("lokaj: {error}")));
-                    return End::Fatal;
+                    return self.fail("protocol", &fatal("08P01", format!("lokaj: {error}")));
                 }
             } {
                 let frame = self.cli_in.split_to(len);
                 let msg = match protocol::parse_frontend(msg_tag, &frame[5..]) {
                     Ok(msg) => msg,
                     Err(error) => {
-                        self.queue_fatal(&fatal("08P01", format!("lokaj: {error}")));
-                        return End::Fatal;
+                        return self.fail("protocol", &fatal("08P01", format!("lokaj: {error}")));
                     }
                 };
                 let a = match assigned {
@@ -695,10 +727,7 @@ impl Session {
                         match relay.on_frontend(&msg) {
                             Ok(FrontendAction::Forward) => {}
                             Ok(FrontendAction::Terminate) => return End::Closed,
-                            Err(rejected) => {
-                                self.queue_fatal(&fatal(rejected.code, rejected.message));
-                                return End::Fatal;
-                            }
+                            Err(rejected) => return self.refuse(rejected),
                         }
                         match self.assign(relay).await {
                             Ok(Some(a)) => {
@@ -717,10 +746,7 @@ impl Session {
                 match a.relay.on_frontend(&msg) {
                     Ok(FrontendAction::Forward) => a.to_server.extend_from_slice(&frame),
                     Ok(FrontendAction::Terminate) => return End::Closed,
-                    Err(rejected) => {
-                        self.queue_fatal(&fatal(rejected.code, rejected.message));
-                        return End::Fatal;
-                    }
+                    Err(rejected) => return self.refuse(rejected),
                 }
             }
 
@@ -774,13 +800,15 @@ impl Session {
                 Event::ClientSent(Ok(Sent::Flushed)) => self.client_unflushed = false,
                 Event::ServerRead(Ok(0) | Err(_))
                 | Event::ServerSent(Ok(Sent::Wrote(0)) | Err(_)) => {
-                    self.queue_fatal(&fatal("08006", "lokaj: server connection lost"));
                     if let Some(lost) = assigned.take() {
                         self.cancel.detach();
                         self.app.metrics.recycle("server_lost");
                         drop(lost);
                     }
-                    return End::Fatal;
+                    return self.fail(
+                        "server_lost",
+                        &fatal("08006", "lokaj: server connection lost"),
+                    );
                 }
                 Event::ServerRead(Ok(_)) => {
                     let Some(a) = assigned.as_mut() else { continue };
@@ -810,16 +838,21 @@ impl Session {
                                 self.app.metrics.recycle("server_fatal");
                                 drop(gone);
                             }
+                            self.app.metrics.session_error("server_fatal");
                             return End::Fatal;
                         }
                         Err(ServerViolation::Copy) => {
-                            self.queue_fatal(&fatal("0A000", "lokaj: COPY is not supported"));
-                            return End::Fatal;
+                            return self.refuse(Rejected {
+                                code: "0A000",
+                                message: "lokaj: COPY is not supported".into(),
+                            });
                         }
                         Err(error @ ServerViolation::Protocol(_)) => {
                             tracing::warn!(user = %self.labels.user, database = %self.labels.database, %error, "closing server connection");
-                            self.queue_fatal(&fatal("08P01", "lokaj: server protocol violation"));
-                            return End::Fatal;
+                            return self.fail(
+                                "server_protocol",
+                                &fatal("08P01", "lokaj: server protocol violation"),
+                            );
                         }
                     }
                 }
@@ -839,21 +872,28 @@ impl Session {
                     return End::Fatal;
                 }
                 Event::IdleTimeout => {
-                    self.queue_fatal(&fatal(
-                        "25P03",
-                        "lokaj: terminating connection due to idle-in-transaction timeout",
-                    ));
-                    return End::Fatal;
+                    if let Some(idle) = assigned.take() {
+                        self.abort(idle, "idle_in_transaction");
+                    }
+                    return self.fail(
+                        "idle_in_transaction",
+                        &fatal(
+                            "25P03",
+                            "lokaj: terminating connection due to idle-in-transaction timeout",
+                        ),
+                    );
                 }
                 Event::ClientStalled => {
                     if let Some(stalled) = assigned.take() {
                         self.abort(stalled, "client_stalled");
                     }
-                    self.queue_fatal(&fatal(
-                        "08006",
-                        "lokaj: terminating connection because the client stopped reading",
-                    ));
-                    return End::Fatal;
+                    return self.fail(
+                        "client_stalled",
+                        &fatal(
+                            "08006",
+                            "lokaj: terminating connection because the client stopped reading",
+                        ),
+                    );
                 }
             }
         }

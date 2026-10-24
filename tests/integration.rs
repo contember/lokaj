@@ -484,6 +484,46 @@ async fn a_client_idle_in_a_transaction_gives_up_its_connection() {
     unsynced.send(&parse("", "select 1")).await;
     assert_eq!(unsynced.expect_fatal().await.code, "25P03");
     other.query("select 1").await.unwrap();
+    assert_eq!(
+        lokaj
+            .metric("lokaj_session_errors_total{reason=\"idle_in_transaction\"}")
+            .await,
+        2.0
+    );
+}
+
+#[tokio::test]
+async fn sessions_refused_a_connection_are_counted() {
+    require_pg!();
+    let lokaj = Lokaj::with(|c| {
+        c.pool.max_size = 1;
+        c.pool.max_waiters = 0;
+    })
+    .await;
+    let alice = tenant().await;
+    let mut a = lokaj.login(&alice).await;
+    a.query("begin").await.unwrap();
+    let waits = || async {
+        let mut total = 0.0;
+        for source in ["idle", "released", "new"] {
+            let sample = format!("lokaj_pool_wait_seconds_count{{source=\"{source}\"}}");
+            total += lokaj.metric(&sample).await;
+        }
+        total
+    };
+    let before = waits().await;
+    assert!(before > 0.0);
+    let mut b = lokaj.login(&alice).await;
+    b.send(&query("select 1")).await;
+    assert_eq!(b.expect_fatal().await.code, "53300");
+    assert_eq!(
+        lokaj
+            .metric("lokaj_session_errors_total{reason=\"too_many_waiters\"}")
+            .await,
+        1.0
+    );
+    // Only waits that got a connection are in the histogram.
+    assert_eq!(waits().await, before);
 }
 
 #[tokio::test]
@@ -824,6 +864,12 @@ async fn admin_endpoints() {
     );
     assert_eq!(lokaj.metric(&sample).await, 1.0);
     let (_, metrics) = lokaj.http("/metrics").await;
-    assert!(metrics.contains("lokaj_pool_wait_seconds_bucket"));
+    assert_eq!(
+        lokaj
+            .metric("lokaj_pool_wait_seconds_count{source=\"idle\"}")
+            .await,
+        1.0
+    );
+    assert_eq!(lokaj.metric("lokaj_servers_max").await, 300.0);
     assert!(!metrics.contains(&alice.password));
 }

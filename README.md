@@ -248,15 +248,22 @@ All metrics are prefixed `lokaj_`.
 | `server_connects_total`                                 |                    | server connections established                  |
 | `server_connect_errors_total`                           | `reason`           | failed server connection attempts               |
 | `server_recycles_total`                                 | `reason`           | server connections closed by lokaj              |
-| `servers`                                               |                    | open server connections                         |
+| `servers`, `servers_max`                                |                    | open server connections, and `pool.max_total`   |
+| `clients_waiting_permit`                                |                    | clients waiting because `pool.max_total` is full |
+| `session_errors_total`                                  | `reason`           | sessions lokaj ended with an error after login  |
 | `auth_failures_total`                                   | `reason`           | rejected client logins                          |
 | `credential_cache_total`                                | `result`           | logins answered from the cache (`hit`/`miss`)   |
 | `dns_changes_total`                                     |                    | changes of the server address set               |
 | `cancels_total`                                         | `result`           | cancel requests                                 |
-| `pool_wait_seconds`                                     | `user`, `database` | time clients waited for a server connection     |
+| `pool_wait_seconds`                                     | `source`           | wait for a connection: `idle`, `released`, `new` |
 | `pool_transactions_total`                               | `user`, `database` | completed assignments                           |
 | `pool_clients`, `pool_clients_active`, `pool_clients_waiting` | `user`, `database` | clients logged in, assigned, waiting      |
 | `pool_servers_active`, `pool_servers_idle`              | `user`, `database` | server connections                              |
+
+Per-pool gauges are left out for pools that are empty. `session_errors_total` reasons:
+`wait_timeout`, `too_many_waiters` and `connect_failed` (no server connection),
+`unsupported` and `protocol` (a refused client message, also logged with user and database),
+`idle_in_transaction`, `client_stalled`, `server_lost`, `server_fatal` and `server_protocol`.
 
 ## Errors sent to clients
 

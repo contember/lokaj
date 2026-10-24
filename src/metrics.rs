@@ -22,6 +22,11 @@ pub struct Outcome {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WaitSource {
+    pub source: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PoolLabels {
     pub user: String,
     pub database: String,
@@ -45,7 +50,9 @@ pub struct Metrics {
     pub credential_cache: Family<Outcome, Counter>,
     pub dns_changes: Counter,
     pub cancels: Family<Outcome, Counter>,
-    pub pool_wait: Family<PoolLabels, Histogram, fn() -> Histogram>,
+    pub session_errors: Family<Reason, Counter>,
+    /// Across pools: per tenant it would be a dozen series for each of ~a thousand pools.
+    pub pool_wait: Family<WaitSource, Histogram, fn() -> Histogram>,
     pub pool_transactions: Family<PoolLabels, Counter>,
 }
 
@@ -67,6 +74,7 @@ impl Metrics {
             credential_cache: Family::default(),
             dns_changes: Counter::default(),
             cancels: Family::default(),
+            session_errors: Family::default(),
             pool_wait: Family::new_with_constructor(wait_histogram),
             pool_transactions: Family::default(),
         }
@@ -94,15 +102,18 @@ impl Metrics {
         self.cancels.get_or_create(&Outcome { result }).inc();
     }
 
+    pub fn session_error(&self, reason: &'static str) {
+        self.session_errors.get_or_create(&Reason { reason }).inc();
+    }
+
     pub fn credential_cache(&self, result: &'static str) {
         self.credential_cache
             .get_or_create(&Outcome { result })
             .inc();
     }
 
-    /// Drops the series of a pool that no longer exists.
+    /// Drops the series of a tenant that no longer has pools.
     pub fn forget_pool(&self, labels: &PoolLabels) {
-        self.pool_wait.remove(labels);
         self.pool_transactions.remove(labels);
     }
 
@@ -145,8 +156,13 @@ impl Metrics {
         );
         registry.register("cancels", "Cancel requests", self.cancels.clone());
         registry.register(
+            "session_errors",
+            "Client sessions lokaj ended with an error after login",
+            self.session_errors.clone(),
+        );
+        registry.register(
             "pool_wait_seconds",
-            "Time clients waited for a server connection",
+            "Time clients waited for a server connection, by where it came from",
             self.pool_wait.clone(),
         );
         registry.register(
@@ -176,9 +192,17 @@ impl std::ops::AddAssign<&PoolStats> for PoolStats {
     }
 }
 
-/// Source of per-pool gauges, read on every scrape.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalStats {
+    pub servers_max: usize,
+    /// Clients waiting for a connection because `max_total` is reached.
+    pub clients_waiting_permit: usize,
+}
+
+/// Source of pool gauges, read on every scrape.
 pub trait PoolStatsSource: std::fmt::Debug + Send + Sync + 'static {
     fn pool_stats(&self) -> Vec<(PoolLabels, PoolStats)>;
+    fn global_stats(&self) -> GlobalStats;
 }
 
 #[derive(Debug)]
@@ -191,6 +215,14 @@ impl<S: PoolStatsSource> Collector for PoolCollector<S> {
         for (labels, stats) in self.0.pool_stats() {
             *pools.entry(labels).or_default() += &stats;
         }
+        let total: usize = pools
+            .values()
+            .map(|s| s.servers_active + s.servers_idle)
+            .sum();
+        // Pools with nothing in them are most of them; their zeros are left out.
+        pools.retain(|_, s| {
+            s.clients + s.clients_active + s.clients_waiting + s.servers_active + s.servers_idle > 0
+        });
         type Gauge = (&'static str, &'static str, fn(&PoolStats) -> usize);
         let gauges: [Gauge; 5] = [
             ("pool_clients", "Clients logged in to the pool", |s| {
@@ -222,17 +254,75 @@ impl<S: PoolStatsSource> Collector for PoolCollector<S> {
                 ConstGauge::new(value(stats) as i64).encode(family.encode_family(labels)?)?;
             }
         }
-        let total: usize = pools
-            .values()
-            .map(|s| s.servers_active + s.servers_idle)
-            .sum();
-        let gauge = ConstGauge::new(total as i64);
-        gauge.encode(encoder.encode_descriptor(
-            "servers",
-            "Open server connections",
-            None,
-            gauge.metric_type(),
-        )?)?;
+        let global = self.0.global_stats();
+        let globals = [
+            ("servers", "Open server connections", total),
+            (
+                "servers_max",
+                "Server connections allowed across pools (pool.max_total)",
+                global.servers_max,
+            ),
+            (
+                "clients_waiting_permit",
+                "Clients waiting because pool.max_total is reached",
+                global.clients_waiting_permit,
+            ),
+        ];
+        for (name, help, value) in globals {
+            let gauge = ConstGauge::new(value as i64);
+            gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Pools;
+
+    impl PoolStatsSource for Pools {
+        fn pool_stats(&self) -> Vec<(PoolLabels, PoolStats)> {
+            (0..1000)
+                .map(|i| {
+                    let labels = PoolLabels {
+                        user: format!("u{i}"),
+                        database: "d".into(),
+                    };
+                    let stats = PoolStats {
+                        servers_idle: usize::from(i < 50),
+                        ..PoolStats::default()
+                    };
+                    (labels, stats)
+                })
+                .collect()
+        }
+
+        fn global_stats(&self) -> GlobalStats {
+            GlobalStats {
+                servers_max: 300,
+                clients_waiting_permit: 2,
+            }
+        }
+    }
+
+    #[test]
+    fn empty_pools_are_left_out_of_the_gauges() {
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(PoolCollector(Pools)));
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+        let samples = |name: &str| {
+            text.lines()
+                .filter(|line| line.starts_with(&format!("{name}{{")))
+                .count()
+        };
+        assert_eq!(samples("pool_servers_idle"), 50);
+        assert_eq!(samples("pool_clients"), 50);
+        for sample in ["servers 50", "servers_max 300", "clients_waiting_permit 2"] {
+            assert!(text.lines().any(|line| line == sample), "{sample} missing");
+        }
     }
 }

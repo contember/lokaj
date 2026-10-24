@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, sleep, sleep_until};
 
-use crate::metrics::{Metrics, PoolLabels, PoolStats, PoolStatsSource};
+use crate::metrics::{GlobalStats, Metrics, PoolLabels, PoolStats, PoolStatsSource};
 
 pub trait Connector: Send + Sync + 'static {
     type Conn: Send + 'static;
@@ -195,8 +195,28 @@ impl<C: Connector> Drop for Slot<C> {
 pub struct Lease<C: Connector> {
     pool: Arc<Pool<C>>,
     inner: Option<(C::Conn, Slot<C>)>,
-    /// Whether the connection was opened for this lease.
-    pub fresh: bool,
+    pub source: Source,
+}
+
+/// Where a lease's connection came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The pool's idle list.
+    Idle,
+    /// Another client released it while this one waited.
+    Released,
+    /// Opened for this lease.
+    New,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Idle => "idle",
+            Source::Released => "released",
+            Source::New => "new",
+        }
+    }
 }
 
 impl<C: Connector> Lease<C> {
@@ -272,12 +292,12 @@ impl<C: Connector> Pool<C> {
         &self.labels
     }
 
-    fn lease(self: &Arc<Self>, conn: C::Conn, slot: Slot<C>, fresh: bool) -> Lease<C> {
+    fn lease(self: &Arc<Self>, conn: C::Conn, slot: Slot<C>, source: Source) -> Lease<C> {
         self.leased.fetch_add(1, Ordering::Relaxed);
         Lease {
             pool: self.clone(),
             inner: Some((conn, slot)),
-            fresh,
+            source,
         }
     }
 
@@ -296,7 +316,7 @@ impl<C: Connector> Pool<C> {
                 permit: Some(permit),
             }
         };
-        Some(self.lease(conn, slot, true))
+        Some(self.lease(conn, slot, Source::New))
     }
 
     fn slot_freed(self: &Arc<Self>, mut permit: OwnedSemaphorePermit) {
@@ -465,7 +485,7 @@ impl<C: Connector> Pool<C> {
                         .revalidate(&self.data, &mut conn, since.elapsed())
                         .await
                     {
-                        Ok(()) => return Ok(self.lease(conn, slot, false)),
+                        Ok(()) => return Ok(self.lease(conn, slot, Source::Idle)),
                         Err(reason) => {
                             self.shared.metrics.recycle(reason);
                             self.shared.connector.close(&mut conn);
@@ -473,10 +493,12 @@ impl<C: Connector> Pool<C> {
                         }
                     }
                 }
-                Obtained::Granted(conn, slot) => return Ok(self.lease(conn, slot, false)),
+                Obtained::Granted(conn, slot) => {
+                    return Ok(self.lease(conn, slot, Source::Released));
+                }
                 Obtained::Slot(slot) => {
                     let conn = self.open(deadline).await?;
-                    return Ok(self.lease(conn, slot, true));
+                    return Ok(self.lease(conn, slot, Source::New));
                 }
             }
         }
@@ -696,16 +718,19 @@ impl<C: Connector> Pools<C> {
                 }
                 !unused
             });
-            for pool in &removed {
+            let mut forgotten = Vec::new();
+            for pool in removed {
                 let tenant = (pool.key.user.clone(), pool.key.database.clone());
                 if let Some(variants) = map.variants.get_mut(&tenant) {
                     *variants -= 1;
+                    // Variants share metric labels, so the series go with the last one.
                     if *variants == 0 {
                         map.variants.remove(&tenant);
+                        forgotten.push(pool);
                     }
                 }
             }
-            removed
+            forgotten
         };
         for pool in removed {
             self.shared.metrics.forget_pool(&pool.labels);
@@ -724,6 +749,13 @@ impl<C: Connector> PoolStatsSource for Pools<C> {
             .iter()
             .map(|pool| (pool.labels.clone(), pool.stats()))
             .collect()
+    }
+
+    fn global_stats(&self) -> GlobalStats {
+        GlobalStats {
+            servers_max: self.shared.limits.max_total,
+            clients_waiting_permit: self.shared.permit_waiters.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -843,11 +875,11 @@ mod tests {
         let pool = pools.register(key("a")).unwrap();
         let lease = pool.acquire(deadline()).await.unwrap();
         let id = lease.conn().id;
-        assert!(lease.fresh);
+        assert_eq!(lease.source, Source::New);
         lease.release();
         let lease = pool.acquire(deadline()).await.unwrap();
         assert_eq!(lease.conn().id, id);
-        assert!(!lease.fresh);
+        assert_eq!(lease.source, Source::Idle);
         assert_eq!(pools.connector().opened.load(Ordering::SeqCst), 1);
     }
 
@@ -879,11 +911,11 @@ mod tests {
         let held = pool.acquire(deadline()).await.unwrap();
         let waiter = {
             let pool = pool.clone();
-            tokio::spawn(async move { pool.acquire(deadline()).await.map(|l| l.fresh) })
+            tokio::spawn(async move { pool.acquire(deadline()).await.map(|l| l.source) })
         };
         tokio::task::yield_now().await;
         drop(held);
-        assert_eq!(waiter.await.unwrap(), Ok(true));
+        assert_eq!(waiter.await.unwrap(), Ok(Source::New));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1076,6 +1108,36 @@ mod tests {
         tokio::time::advance(Duration::from_secs(301)).await;
         pools.reap();
         pools.register(variant("3")).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collecting_one_option_variant_keeps_the_tenant_metrics() {
+        let pools = pools(2, 10);
+        let variant = |timeout: &str| PoolKey {
+            options: vec![("statement_timeout".into(), timeout.into())],
+            ..key("a")
+        };
+        let first = pools.register(variant("1")).unwrap();
+        let second = pools.register(variant("2")).unwrap();
+        let transactions = || {
+            pools
+                .shared
+                .metrics
+                .pool_transactions
+                .get_or_create(first.labels())
+                .get()
+        };
+        pools
+            .shared
+            .metrics
+            .pool_transactions
+            .get_or_create(first.labels())
+            .inc();
+        drop(second);
+        tokio::time::advance(Duration::from_secs(301)).await;
+        pools.reap();
+        assert_eq!(pools.list().len(), 1);
+        assert_eq!(transactions(), 1);
     }
 
     #[derive(Debug, Clone)]
