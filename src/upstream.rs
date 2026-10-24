@@ -137,9 +137,6 @@ impl Connector for Upstream {
         if let Some(reason) = self.expired(snapshot, conn, idle_for) {
             return Err(reason);
         }
-        if conn.idle_disturbed() {
-            return Err("server_closed");
-        }
         if idle_for >= self.check_after && !conn.health_check(self.check_timeout).await {
             return Err("health_check");
         }
@@ -149,10 +146,12 @@ impl Connector for Upstream {
     fn expired(
         &self,
         snapshot: &Snapshot,
-        conn: &ServerConn,
+        conn: &mut ServerConn,
         idle_for: Duration,
     ) -> Option<&'static str> {
-        if idle_for >= self.idle_timeout {
+        if conn.idle_disturbed() {
+            Some("server_closed")
+        } else if idle_for >= self.idle_timeout {
             Some("idle_timeout")
         } else if conn.expired() {
             Some("lifetime")
@@ -163,5 +162,9 @@ impl Connector for Upstream {
         } else {
             None
         }
+    }
+
+    fn close(&self, conn: &mut ServerConn) {
+        conn.terminate();
     }
 }

@@ -75,6 +75,29 @@ async fn an_idle_connection_the_server_closed_is_not_reused() {
 }
 
 #[tokio::test]
+async fn the_reaper_closes_idle_connections_the_server_closed() {
+    require_pg!();
+    let lokaj = Lokaj::start().await;
+    let alice = tenant().await;
+    let mut a = lokaj.login(&alice).await;
+    let pid = backend_pid(&mut a).await;
+    admin()
+        .await
+        .query(&format!("select pg_terminate_backend({pid}, 5000)"))
+        .await
+        .unwrap();
+    // No client asks for the connection; the reaper's next pass finds it.
+    let sample = "lokaj_server_recycles_total{reason=\"server_closed\"}";
+    for _ in 0..30 {
+        if lokaj.metric(sample).await == 1.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(lokaj.metric(sample).await, 1.0);
+}
+
+#[tokio::test]
 async fn passwords_are_verified_by_the_server() {
     require_pg!();
     let lokaj = Lokaj::start().await;

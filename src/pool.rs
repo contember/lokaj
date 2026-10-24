@@ -35,13 +35,16 @@ pub trait Connector: Send + Sync + 'static {
         idle_for: Duration,
     ) -> impl Future<Output = Result<(), &'static str>> + Send;
 
-    /// Cheap check of an idle connection, run periodically by the reaper.
+    /// Cheap check of an idle connection, run every second by the reaper; it must not block.
     fn expired(
         &self,
         data: &Self::PoolData,
-        conn: &Self::Conn,
+        conn: &mut Self::Conn,
         idle_for: Duration,
     ) -> Option<&'static str>;
+
+    /// Ends an idle connection the pool is about to drop, without waiting.
+    fn close(&self, conn: &mut Self::Conn);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -426,6 +429,7 @@ impl<C: Connector> Pool<C> {
                         Ok(()) => return Ok(self.lease(conn, slot, false)),
                         Err(reason) => {
                             self.shared.metrics.recycle(reason);
+                            self.shared.connector.close(&mut conn);
                             drop((conn, slot));
                         }
                     }
@@ -511,8 +515,9 @@ impl<C: Connector> Shared<C> {
             (!state.idle.is_empty()).then(|| state.idle.remove(0))
         };
         match victim {
-            Some(victim) => {
+            Some(mut victim) => {
                 self.metrics.recycle("evicted");
+                self.connector.close(&mut victim.conn);
                 drop(victim);
                 true
             }
@@ -593,10 +598,10 @@ impl<C: Connector> Pools<C> {
                 let mut expired = Vec::new();
                 let mut i = 0;
                 while i < state.idle.len() {
-                    let idle = &state.idle[i];
+                    let idle = &mut state.idle[i];
                     match self.shared.connector.expired(
                         &pool.data,
-                        &idle.conn,
+                        &mut idle.conn,
                         idle.since.elapsed(),
                     ) {
                         Some(reason) => expired.push((state.idle.remove(i), reason)),
@@ -605,8 +610,9 @@ impl<C: Connector> Pools<C> {
                 }
                 expired
             };
-            for (idle, reason) in expired {
+            for (mut idle, reason) in expired {
                 self.shared.metrics.recycle(reason);
+                self.shared.connector.close(&mut idle.conn);
                 drop(idle);
             }
         }
@@ -668,12 +674,14 @@ mod tests {
         id: u64,
         key: PoolKey,
         broken: bool,
+        closed: bool,
     }
 
     #[derive(Default)]
     struct FakeConnector {
         next_id: AtomicU64,
         opened: AtomicUsize,
+        closed: AtomicUsize,
     }
 
     impl Connector for FakeConnector {
@@ -691,6 +699,7 @@ mod tests {
                 id: self.next_id.fetch_add(1, Ordering::SeqCst),
                 key: key.clone(),
                 broken: false,
+                closed: false,
             })
         }
 
@@ -703,8 +712,17 @@ mod tests {
             if conn.broken { Err("broken") } else { Ok(()) }
         }
 
-        fn expired(&self, _: &(), _: &FakeConn, idle_for: Duration) -> Option<&'static str> {
-            (idle_for >= Duration::from_secs(60)).then_some("idle_timeout")
+        fn expired(&self, _: &(), conn: &mut FakeConn, idle_for: Duration) -> Option<&'static str> {
+            if conn.broken {
+                Some("broken")
+            } else {
+                (idle_for >= Duration::from_secs(60)).then_some("idle_timeout")
+            }
+        }
+
+        fn close(&self, conn: &mut FakeConn) {
+            conn.closed = true;
+            self.closed.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -836,10 +854,23 @@ mod tests {
         tokio::time::advance(Duration::from_secs(61)).await;
         pools.reap();
         assert_eq!(pool.stats().servers_idle, 0);
+        assert_eq!(pools.connector().closed.load(Ordering::SeqCst), 1);
         drop(pool);
         tokio::time::advance(Duration::from_secs(301)).await;
         pools.reap();
         assert!(pools.list().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_closes_idle_connections_the_server_closed() {
+        let pools = pools(2, 10);
+        let pool = pools.register(key("a")).unwrap();
+        let mut lease = pool.acquire(deadline()).await.unwrap();
+        lease.conn_mut().broken = true;
+        lease.release();
+        pools.reap();
+        assert_eq!(pool.stats().servers_idle, 0);
+        assert_eq!(pools.open_total(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -850,6 +881,7 @@ mod tests {
             id,
             key: key("a"),
             broken: false,
+            closed: false,
         };
         pool.try_adopt(outside(999)).unwrap().release();
         let lease = pool.acquire(deadline()).await.unwrap();

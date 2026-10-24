@@ -594,9 +594,10 @@ impl Session {
             to_server,
             ..
         } = assigned;
+        let clean = lease.conn().buf.is_empty() && to_server.is_empty() && stream.at_boundary();
         let reason = if cancelled {
             Some("cancelled")
-        } else if !lease.conn().buf.is_empty() || !to_server.is_empty() || !stream.at_boundary() {
+        } else if !clean {
             Some("protocol")
         } else {
             let pool = lease.pool().clone();
@@ -613,6 +614,9 @@ impl Session {
         match reason {
             Some(reason) => {
                 self.app.metrics.recycle(reason);
+                if clean {
+                    lease.conn_mut().terminate();
+                }
                 drop(lease);
             }
             None => lease.release(),

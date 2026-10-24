@@ -158,7 +158,11 @@ transaction. Give the roles read-only privileges for a hard boundary.
   - Server and client connections use TCP keepalive after `server.keepalive_time`, and
     `TCP_USER_TIMEOUT` closes them when sent data stays unacknowledged for 30 s longer. A peer
     that vanishes mid-query is noticed within about a minute.
+  - Idle connections are checked every second, and one the server closed or sent anything on
+    is closed right away.
   - A connection idle longer than `server.check_after` gets one round trip before reuse.
+  - lokaj ends idle and recycled connections with `Terminate`, so the server logs no unexpected
+    EOF.
   - Empty pools are dropped after `pool.gc_after`.
 - **Snapshot.** When a new server connection reports different parameters, the snapshot moves
   on and older connections are retired.

@@ -5,13 +5,13 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::{Context, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use rustls_pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 use tokio_rustls::TlsConnector;
@@ -407,6 +407,20 @@ impl ServerConn {
             .is_ready()
     }
 
+    /// Sends `Terminate` and closes TLS if the socket takes them right away, so the server sees
+    /// a clean end instead of an unexpected EOF. Only for a connection at a message boundary.
+    pub fn terminate(&mut self) {
+        let mut out = BytesMut::new();
+        protocol::terminate(&mut out);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut stream = Pin::new(&mut self.stream);
+        if let Poll::Ready(Ok(n)) = stream.as_mut().poll_write(&mut cx, &out)
+            && n == out.len()
+        {
+            let _ = stream.poll_shutdown(&mut cx);
+        }
+    }
+
     /// One round trip: a `Sync` outside a pipeline makes the server answer `ReadyForQuery`.
     pub async fn health_check(&mut self, limit: Duration) -> bool {
         let check = async {
@@ -464,6 +478,87 @@ pub async fn send_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
+    use tokio_rustls::TlsAcceptor;
+
+    /// A server connection over TLS on loopback, and the server's end of it.
+    async fn tls_conn() -> (ServerConn, tokio_rustls::server::TlsStream<TcpStream>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, connected) = tokio::join!(
+            async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                TlsAcceptor::from(Arc::new(server))
+                    .accept(tcp)
+                    .await
+                    .unwrap()
+            },
+            async {
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                TlsConnector::from(Arc::new(client))
+                    .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                    .await
+                    .unwrap()
+            },
+        );
+        let conn = ServerConn {
+            stream: connected,
+            buf: BytesMut::new(),
+            cancel_key: ServerCancelKey {
+                addr,
+                process_id: 1,
+                secret: vec![0; 4],
+            },
+            params: Params::default(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+            generation: 0,
+        };
+        (conn, accepted)
+    }
+
+    #[tokio::test]
+    async fn terminate_ends_the_session_cleanly() {
+        let (mut conn, mut server) = tls_conn().await;
+        assert!(!conn.idle_disturbed());
+        conn.terminate();
+        let mut received = Vec::new();
+        // A clean TLS close ends the stream; an EOF without close_notify would be an error.
+        timeout(Duration::from_secs(5), server.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, [b'X', 0, 0, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_the_server_closed_is_disturbed() {
+        let (mut conn, mut server) = tls_conn().await;
+        server.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !conn.idle_disturbed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
