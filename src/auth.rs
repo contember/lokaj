@@ -183,12 +183,10 @@ impl AuthCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Verification<T, E>>,
     {
-        let refuse = || {
-            self.record_source_failure(&key.user, source);
-            Err(AuthError::RateLimited)
-        };
+        // Not counted again, so the lock ends one window after the last counted attempt even
+        // while the client keeps retrying.
         if self.source_locked(&key.user, source) {
-            return refuse();
+            return Err(AuthError::RateLimited);
         }
         let mac = self.mac(key, password);
         if self.matches_fresh(key, &mac) {
@@ -200,7 +198,9 @@ impl AuthCache {
             return Ok(Login::Cached);
         }
         let Some(mut verifying) = self.begin_verification(&key.user) else {
-            return refuse();
+            // Counted, or a source could test guesses against the cache for free.
+            self.record_source_failure(&key.user, source);
+            return Err(AuthError::RateLimited);
         };
         match verify().await {
             Verification::Accepted(keys, value) => {
@@ -433,6 +433,61 @@ mod tests {
             login(&cache, &alice, "pw", "pw").await,
             Ok(Login::Cached)
         ));
+    }
+
+    /// Logs in with `password` every 5 s, as a reconnecting driver does, until the server
+    /// verifies it; returns how long that took.
+    async fn retry_until_verified(cache: &AuthCache, source: IpAddr, password: &str) -> Duration {
+        let alice = key("alice");
+        let started = Instant::now();
+        loop {
+            match login_from(cache, source, &alice, password, password).await {
+                Ok(Login::Verified(())) => return started.elapsed(),
+                Err(AuthError::RateLimited) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(300),
+                "never verified"
+            );
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_ends_one_window_after_the_last_rejection_while_the_client_retries() {
+        let cache = cache();
+        for _ in 0..3 {
+            assert_eq!(
+                login(&cache, &key("alice"), "old", "new")
+                    .await
+                    .unwrap_err(),
+                AuthError::Rejected(())
+            );
+        }
+        assert_eq!(
+            retry_until_verified(&cache, POD, "new").await,
+            Duration::from_secs(60)
+        );
+        assert!(matches!(
+            login(&cache, &key("alice"), "new", "new").await,
+            Ok(Login::Cached)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_user_budget_holds_off_another_source_for_one_window() {
+        let cache = cache();
+        for _ in 0..3 {
+            login_from(&cache, OTHER_POD, &key("alice"), "old", "new")
+                .await
+                .unwrap_err();
+        }
+        // Refused for the spent budget until locked, and through when the window has passed.
+        assert_eq!(
+            retry_until_verified(&cache, POD, "new").await,
+            Duration::from_secs(60)
+        );
     }
 
     #[tokio::test(start_paused = true)]

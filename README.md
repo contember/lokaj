@@ -68,10 +68,12 @@ the server only holds as many backends as there are concurrent transactions.
    counted within `auth.failure_window`, in two ways, and a refused login gets `28P01`:
    - **Per user and client address.** After `auth.max_failures` failed logins, that address is
      refused for that user, even with the right password, so it cannot test guesses against
-     the cache either. Each refused attempt counts as another failure.
+     the cache either. Attempts refused while the address is locked do not count, so the lock
+     ends one window after the last failure even if the client keeps retrying.
    - **Per user, across all addresses.** Failed and running verifications together stay below
      `auth.max_failures`. Past that, a login that needs a server verification is refused
-     without reaching the server. Logins that match a fresh cached credential still succeed.
+     without reaching the server, and the refusal counts for its address, which could otherwise
+     test guesses against the cache. Logins that match a fresh cached credential still succeed.
 
    The second limit is a trade-off: a client that can reach lokaj from many addresses can fail
    logins for a user on purpose and block its new verifications for one window. Clients with a
