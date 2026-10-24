@@ -50,8 +50,12 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Host name of the server (a reader endpoint), resolved for every new connection.
+    /// Host name of the server (a reader endpoint), resolved for every new connection. Server
+    /// certificates are verified against this name.
     pub host: String,
+    /// CA certificates (PEM) that server certificates must chain to. Server connections always
+    /// use TLS: they carry the SCRAM exchange, and an unverified server could plant credentials.
+    pub ca: PathBuf,
     #[serde(default = "defaults::port")]
     pub port: u16,
     /// `application_name` of server connections.
@@ -333,6 +337,7 @@ mod tests {
         key = "key.pem"
         [server]
         host = "db.internal"
+        ca = "ca.pem"
     "#;
 
     #[test]

@@ -1,4 +1,5 @@
-# Every key with its default; only `listen`, `admin_listen`, `[tls]` and `server.host` are required.
+# Every key with its default; only `listen`, `admin_listen`, `[tls]`, `server.host` and `server.ca`
+# are required.
 # Durations use humantime syntax ("500ms", "30s", "5m").
 
 listen = "0.0.0.0:6432"
@@ -15,6 +16,9 @@ key = "/etc/lokaj/tls.key"
 [server]
 # Reader endpoint, resolved for every new server connection.
 host = "reader.db.internal"
+# CA bundle for server certificates. Server connections always use TLS and verify the server's
+# certificate against `host`.
+ca = "/etc/lokaj/server-ca.pem"
 port = 5432
 application_name = "lokaj"
 connect_timeout = "5s"

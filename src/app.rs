@@ -11,7 +11,7 @@ use prometheus_client::registry::Registry;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant, sleep, sleep_until};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::auth::AuthCache;
 use crate::cancel::CancelRegistry;
@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::dns::Resolver;
 use crate::metrics::{Metrics, PoolCollector};
 use crate::pool::{Limits, Pools};
-use crate::server::{self, ServerSettings};
+use crate::server::{self, ServerSettings, ServerTls};
 use crate::upstream::Upstream;
 use crate::{admin, session, tls};
 
@@ -83,6 +83,10 @@ impl App {
         ));
         let upstream = Upstream {
             settings: ServerSettings {
+                tls: ServerTls {
+                    connector: TlsConnector::from(tls::client_config(&server.ca)?),
+                    name: tls::server_name(&server.host)?,
+                },
                 application_name: server.application_name.clone(),
                 connect_timeout: server.connect_timeout,
                 keepalive_time: server.keepalive_time,
@@ -139,8 +143,9 @@ impl App {
         };
         let limit = self.config.server.cancel_timeout;
         let metrics = self.metrics.clone();
+        let pools = self.pools.clone();
         tokio::spawn(async move {
-            match server::send_cancel(&key, limit).await {
+            match server::send_cancel(&key, &pools.connector().settings.tls, limit).await {
                 Ok(()) => metrics.cancel("forwarded"),
                 Err(error) => {
                     metrics.cancel("failed");

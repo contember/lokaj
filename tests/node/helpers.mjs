@@ -37,7 +37,8 @@ export async function createTenant() {
 	} finally {
 		await root.end()
 	}
-	const owner = new pg.Client({ host: pgHost, port: Number(pgPort), ...tenant })
+	// Tenant roles may connect to the server over TLS only; the test CA issued its certificate.
+	const owner = new pg.Client({ host: pgHost, port: Number(pgPort), ssl: { ca }, ...tenant })
 	await owner.connect()
 	try {
 		await owner.query(`

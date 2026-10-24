@@ -614,6 +614,13 @@ pub fn terminate(out: &mut BytesMut) {
     message(out, b'X', |_| {});
 }
 
+pub fn ssl_request() -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&8i32.to_be_bytes());
+    out[4..].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+    out
+}
+
 pub fn cancel_request(process_id: i32, secret: &[u8]) -> BytesMut {
     let mut out = BytesMut::with_capacity(12 + secret.len());
     out.put_i32(12 + secret.len() as i32);

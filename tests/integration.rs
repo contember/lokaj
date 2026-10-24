@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
-use common::{Client, Lokaj, admin, bind, execute, msg, parse, query, sync, tenant, terminate};
+use common::{
+    Client, Lokaj, admin, bind, execute, msg, parse, pki, query, sync, tenant, terminate,
+};
 use lokaj::protocol;
 
 async fn backend_pid(client: &mut Client) -> String {
@@ -22,6 +24,54 @@ async fn tls_is_required() {
         .send_startup(&[("user", "x"), ("database", "x")])
         .await;
     assert_eq!(client.expect_fatal().await.code, "28000");
+}
+
+#[tokio::test]
+async fn server_connections_use_verified_tls() {
+    require_pg!();
+    let lokaj = Lokaj::start().await;
+    let alice = tenant().await;
+    let mut a = lokaj.login(&alice).await;
+    assert_eq!(
+        a.query_one("select ssl::text from pg_stat_ssl where pid = pg_backend_pid()")
+            .await,
+        "true"
+    );
+    // The server's certificate does not chain to this CA.
+    let untrusted = Lokaj::with(|c| c.server.ca = pki().dir.join("ca.crt")).await;
+    let mut client = untrusted.client().await;
+    let error = client
+        .login(&alice.params(), &alice.password)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "08006");
+    assert_eq!(
+        untrusted
+            .metric("lokaj_server_connect_errors_total{reason=\"tls\"}")
+            .await,
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn an_idle_connection_the_server_closed_is_not_reused() {
+    require_pg!();
+    let lokaj = Lokaj::with(|c| c.pool.max_size = 1).await;
+    let alice = tenant().await;
+    let mut a = lokaj.login(&alice).await;
+    let pid = backend_pid(&mut a).await;
+    admin()
+        .await
+        .query(&format!("select pg_terminate_backend({pid}, 5000)"))
+        .await
+        .unwrap();
+    assert_ne!(backend_pid(&mut a).await, pid);
+    assert_eq!(
+        lokaj
+            .metric("lokaj_server_recycles_total{reason=\"server_closed\"}")
+            .await,
+        1.0
+    );
 }
 
 #[tokio::test]

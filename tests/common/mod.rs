@@ -1,6 +1,7 @@
 //! Harness for tests against a real PostgreSQL: a raw protocol client, an in-process lokaj and
 //! per-test roles and databases. Requires `LOKAJ_TEST_PG` (`host:port` of a PostgreSQL 18 with
-//! SCRAM authentication and superuser `postgres`); see `scripts/integration.sh`.
+//! SCRAM authentication, TLS and superuser `postgres`) and `LOKAJ_TEST_PG_CA` (the CA of its
+//! certificate); see `scripts/integration.sh`.
 
 #![allow(dead_code)]
 
@@ -382,6 +383,7 @@ pub fn pki() -> &'static Pki {
 pub fn base_config() -> Config {
     let pg = pg_addr().expect("LOKAJ_TEST_PG");
     let (host, port) = pg.rsplit_once(':').expect("LOKAJ_TEST_PG is host:port");
+    let ca = std::env::var("LOKAJ_TEST_PG_CA").expect("LOKAJ_TEST_PG_CA");
     let dir = &pki().dir;
     let text = format!(
         r#"
@@ -394,6 +396,7 @@ pub fn base_config() -> Config {
         [server]
         host = "{host}"
         port = {port}
+        ca = "{ca}"
         [pool]
         wait_timeout = "3s"
         "#,

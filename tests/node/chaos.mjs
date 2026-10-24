@@ -54,18 +54,24 @@ async function waitFor(what, check, limitMs = 60_000) {
 const psql = (container, sql) =>
 	docker('exec', '-e', 'PGPASSWORD=postgres', container, 'psql', '-h', '127.0.0.1', '-U', 'postgres', '-tAc', sql)
 
+// Both servers use TLS with the test certificate, whose name `reader` lokaj verifies. The key
+// must belong to the server's user.
+const tlsMounts = ['-v', `${pki}/server.crt:/tls/server.crt:ro`, '-v', `${pki}/server.key:/tls/server.key:ro`]
+const tlsOptions = '-c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tmp/server.key'
+
 async function startReplica() {
 	await docker('run', '-d', '--name', `${id}-replica`, '--network', id, '--ip', ip.replica, '--user', 'postgres',
-		'-e', 'PGPASSWORD=replicator', '--entrypoint', 'bash', 'postgres:18', '-c',
-		'[ -f /tmp/pgdata/PG_VERSION ] || pg_basebackup -h primary -U replicator -D /tmp/pgdata -R -X stream -c fast; chmod 700 /tmp/pgdata; exec postgres -D /tmp/pgdata -c max_connections=500')
+		...tlsMounts, '-e', 'PGPASSWORD=replicator', '--entrypoint', 'bash', 'postgres:18', '-c',
+		`install -m 600 /tls/server.key /tmp/server.key; [ -f /tmp/pgdata/PG_VERSION ] || pg_basebackup -h primary -U replicator -D /tmp/pgdata -R -X stream -c fast; chmod 700 /tmp/pgdata; exec postgres -D /tmp/pgdata -c max_connections=500 ${tlsOptions}`)
 }
 
 async function setup() {
 	cleanup()
 	await docker('network', 'create', '--subnet', `${subnet}.0/24`, id)
 	await docker('run', '-d', '--name', `${id}-primary`, '--network', id, '--ip', ip.primary, '--network-alias', 'primary',
-		'-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_HOST_AUTH_METHOD=scram-sha-256',
-		'-e', 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256', 'postgres:18', '-c', 'max_connections=500')
+		...tlsMounts, '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_HOST_AUTH_METHOD=scram-sha-256',
+		'-e', 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256', '--entrypoint', 'bash', 'postgres:18', '-c',
+		`install -o postgres -m 600 /tls/server.key /tmp/server.key; exec docker-entrypoint.sh postgres -c max_connections=500 ${tlsOptions}`)
 	// During initdb the entrypoint's temporary server listens on the Unix socket only.
 	await waitFor('primary', async () => (await psql(`${id}-primary`, 'select 1')) === '1')
 	await psql(`${id}-primary`, "create role replicator replication login password 'replicator'")
@@ -96,6 +102,7 @@ cert = "/etc/lokaj/server.crt"
 key = "/etc/lokaj/server.key"
 [server]
 host = "reader"
+ca = "/etc/lokaj/ca.crt"
 dns_forget_after = "5s"
 check_after = "5s"
 connect_timeout = "3s"

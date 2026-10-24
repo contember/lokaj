@@ -8,8 +8,9 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 docker build -q -t lokaj:chaos "$root" >/dev/null
-"$root/scripts/test-pki.sh" "$work"
-# The image runs as an unprivileged user.
+# lokaj reaches both servers as `reader`.
+"$root/scripts/test-pki.sh" "$work" DNS:reader
+# The lokaj image and the servers run as unprivileged users.
 chmod 644 "$work/server.key"
 chmod 755 "$work"
 touch "$work/hosts"

@@ -493,13 +493,15 @@ struct Assigned {
     relay: Relay,
     stream: BackendStream,
     to_server: BytesMut,
+    /// Like `client_unflushed`, for the TLS stream to the server.
+    server_unflushed: bool,
 }
 
 enum Event {
     ClientRead(std::io::Result<usize>),
     ClientSent(std::io::Result<Sent>),
     ServerRead(std::io::Result<usize>),
-    ServerWrote(std::io::Result<usize>),
+    ServerSent(std::io::Result<Sent>),
     Drain,
     IdleTimeout,
 }
@@ -509,8 +511,8 @@ enum Sent {
     Flushed,
 }
 
-/// Writes queued client output, or with nothing queued, flushes what the TLS stream still holds.
-async fn send_client<W: AsyncWrite + Unpin>(
+/// Writes queued output, or with nothing queued, flushes what the TLS stream still holds.
+async fn send_queued<W: AsyncWrite + Unpin>(
     writer: &mut W,
     queued: &[u8],
 ) -> std::io::Result<Sent> {
@@ -566,8 +568,9 @@ impl Session {
             let key = assigned.lease.conn().cancel_key().clone();
             let limit = self.app.config.server.cancel_timeout;
             let metrics = self.app.metrics.clone();
+            let pools = self.app.pools.clone();
             tokio::spawn(async move {
-                match server::send_cancel(&key, limit).await {
+                match server::send_cancel(&key, &pools.connector().settings.tls, limit).await {
                     Ok(()) => metrics.cancel("abandoned"),
                     Err(error) => {
                         metrics.cancel("failed");
@@ -655,6 +658,7 @@ impl Session {
             relay,
             stream: BackendStream::new(),
             to_server: BytesMut::new(),
+            server_unflushed: false,
         }))
     }
 
@@ -716,14 +720,15 @@ impl Session {
             self.cli_in.reserve(8192);
             let event = match assigned.as_mut() {
                 Some(a) => {
-                    let awaits_client = a.relay.awaits_client() && a.to_server.is_empty();
+                    let awaits_client =
+                        a.relay.awaits_client() && a.to_server.is_empty() && !a.server_unflushed;
                     let conn = a.lease.conn_mut();
                     conn.buf.reserve(32 << 10);
-                    let (mut server_rd, mut server_wr) = conn.stream.split();
+                    let (mut server_rd, mut server_wr) = tokio::io::split(&mut conn.stream);
                     tokio::select! {
                         read = server_rd.read_buf(&mut conn.buf), if self.to_client.len() < HIGH_WATER => Event::ServerRead(read),
-                        sent = send_client(&mut self.writer, &self.to_client), if !self.to_client.is_empty() || self.client_unflushed => Event::ClientSent(sent),
-                        wrote = server_wr.write(&a.to_server), if !a.to_server.is_empty() => Event::ServerWrote(wrote),
+                        sent = send_queued(&mut self.writer, &self.to_client), if !self.to_client.is_empty() || self.client_unflushed => Event::ClientSent(sent),
+                        sent = send_queued(&mut server_wr, &a.to_server), if !a.to_server.is_empty() || a.server_unflushed => Event::ServerSent(sent),
                         read = self.reader.read_buf(&mut self.cli_in), if a.to_server.len() < HIGH_WATER && self.cli_in.len() < max_message => Event::ClientRead(read),
                         () = tokio::time::sleep_until(self.active_at + idle_timeout), if awaits_client => Event::IdleTimeout,
                     }
@@ -735,7 +740,7 @@ impl Session {
                     } else {
                         tokio::select! {
                             read = self.reader.read_buf(&mut self.cli_in), if self.cli_in.len() < max_message => Event::ClientRead(read),
-                            sent = send_client(&mut self.writer, &self.to_client), if !self.to_client.is_empty() || self.client_unflushed => Event::ClientSent(sent),
+                            sent = send_queued(&mut self.writer, &self.to_client), if !self.to_client.is_empty() || self.client_unflushed => Event::ClientSent(sent),
                             _ = self.drain.changed() => continue,
                         }
                     }
@@ -756,7 +761,8 @@ impl Session {
                     self.client_unflushed = true;
                 }
                 Event::ClientSent(Ok(Sent::Flushed)) => self.client_unflushed = false,
-                Event::ServerRead(Ok(0) | Err(_)) | Event::ServerWrote(Ok(0) | Err(_)) => {
+                Event::ServerRead(Ok(0) | Err(_))
+                | Event::ServerSent(Ok(Sent::Wrote(0)) | Err(_)) => {
                     self.queue_fatal(&fatal("08006", "lokaj: server connection lost"));
                     if let Some(lost) = assigned.take() {
                         self.cancel.detach();
@@ -806,9 +812,15 @@ impl Session {
                         }
                     }
                 }
-                Event::ServerWrote(Ok(n)) => {
+                Event::ServerSent(Ok(Sent::Wrote(n))) => {
                     if let Some(a) = assigned.as_mut() {
                         a.to_server.advance(n);
+                        a.server_unflushed = true;
+                    }
+                }
+                Event::ServerSent(Ok(Sent::Flushed)) => {
+                    if let Some(a) = assigned.as_mut() {
+                        a.server_unflushed = false;
                     }
                 }
                 Event::Drain => {
@@ -867,7 +879,7 @@ mod tests {
     async fn a_flush_delivers_what_a_full_pipe_left_behind() {
         let (mut server, mut client) = tls_pipe().await;
         let data: Vec<u8> = (0..32 << 10).map(|i| (i % 251) as u8).collect();
-        let Sent::Wrote(n) = send_client(&mut server, &data).await.unwrap() else {
+        let Sent::Wrote(n) = send_queued(&mut server, &data).await.unwrap() else {
             panic!("expected a write");
         };
         // The write accepted far more than the pipe holds; the rest is only in the TLS stream.
@@ -877,7 +889,7 @@ mod tests {
             client.read_exact(&mut received).await.map(|_| received)
         });
         assert!(matches!(
-            send_client(&mut server, &[]).await.unwrap(),
+            send_queued(&mut server, &[]).await.unwrap(),
             Sent::Flushed
         ));
         let received = timeout(Duration::from_secs(5), reader)

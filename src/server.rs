@@ -1,16 +1,21 @@
-//! Server connections: connect, authenticate with SCRAM-SHA-256, and the cheap checks run on
-//! idle connections.
+//! Server connections: connect over TLS, authenticate with SCRAM-SHA-256, and the cheap checks
+//! run on idle connections.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
+use rustls_pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use zeroize::Zeroizing;
 
 use crate::cancel::ServerCancelKey;
@@ -29,6 +34,10 @@ pub enum ConnectError {
     Io(#[from] io::Error),
     #[error("timed out connecting to the server")]
     Timeout,
+    #[error("server does not accept TLS")]
+    TlsRefused,
+    #[error("TLS handshake with the server failed: {0}")]
+    Tls(io::Error),
     #[error("server error {}: {}", .0.code, .0.message)]
     Server(ErrorFields),
     #[error("SCRAM authentication failed: {0}")]
@@ -63,6 +72,7 @@ impl ConnectError {
             ConnectError::Dns(_) => "dns",
             ConnectError::Io(_) => "io",
             ConnectError::Timeout => "timeout",
+            ConnectError::TlsRefused | ConnectError::Tls(_) => "tls",
             ConnectError::Server(_) if self.is_auth_failure() => "auth",
             ConnectError::Server(_) => "server_error",
             ConnectError::Scram(_) | ConnectError::NoCredential => "auth",
@@ -72,7 +82,14 @@ impl ConnectError {
     }
 }
 
+/// TLS towards the server: the trusted CAs and the name its certificate must match.
+pub struct ServerTls {
+    pub connector: TlsConnector,
+    pub name: ServerName<'static>,
+}
+
 pub struct ServerSettings {
+    pub tls: ServerTls,
     pub application_name: String,
     pub connect_timeout: Duration,
     pub keepalive_time: Duration,
@@ -80,8 +97,10 @@ pub struct ServerSettings {
     pub lifetime_jitter: Duration,
 }
 
+pub type ServerStream = TlsStream<TcpStream>;
+
 pub struct ServerConn {
-    pub stream: TcpStream,
+    pub stream: ServerStream,
     /// Bytes read from the server and not yet processed.
     pub buf: BytesMut,
     cancel_key: ServerCancelKey,
@@ -120,6 +139,26 @@ pub fn keepalive(stream: &TcpStream, time: Duration) -> io::Result<()> {
         .with_interval(Duration::from_secs(10))
         .with_retries(3);
     SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// Negotiates TLS with `SSLRequest`. Only the one-byte answer is read before the handshake, so
+/// bytes the server sent after it cannot pass as if they came through TLS.
+async fn start_tls(mut tcp: TcpStream, tls: &ServerTls) -> Result<ServerStream, ConnectError> {
+    tcp.write_all(&protocol::ssl_request()).await?;
+    let mut answer = [0u8; 1];
+    tcp.read_exact(&mut answer).await?;
+    match answer[0] {
+        b'S' => tls
+            .connector
+            .connect(tls.name.clone(), tcp)
+            .await
+            .map_err(ConnectError::Tls),
+        b'N' => Err(ConnectError::TlsRefused),
+        other => Err(ConnectError::Protocol(format!(
+            "unexpected answer {:?} to SSLRequest",
+            other as char
+        ))),
+    }
 }
 
 impl ServerConn {
@@ -166,6 +205,7 @@ impl ServerConn {
             ));
         };
         keepalive(&stream, settings.keepalive_time)?;
+        let stream = start_tls(stream, &settings.tls).await?;
 
         let mut params: Vec<(&str, &str)> = vec![
             ("user", user),
@@ -189,7 +229,7 @@ impl ServerConn {
             expires_at: Instant::now() + settings.lifetime + jitter(settings.lifetime_jitter),
             generation: 0,
         };
-        conn.stream.write_all(&out).await?;
+        conn.send(&out).await?;
 
         let mut scram: Option<ScramClient> = None;
         let mut keys: Option<ScramKeys> = None;
@@ -208,7 +248,7 @@ impl ServerConn {
                         let (client, first) = ScramClient::start();
                         out.clear();
                         protocol::sasl_initial_response(&mut out, scram::MECHANISM, &first);
-                        conn.stream.write_all(&out).await?;
+                        conn.send(&out).await?;
                         scram = Some(client);
                     }
                     Authentication::SaslContinue(data) => {
@@ -235,7 +275,7 @@ impl ServerConn {
                         let message = client.respond(&first, &derived)?;
                         out.clear();
                         protocol::sasl_response(&mut out, &message);
-                        conn.stream.write_all(&out).await?;
+                        conn.send(&out).await?;
                         keys = Some(derived);
                     }
                     Authentication::SaslFinal(data) => {
@@ -298,6 +338,12 @@ impl ServerConn {
         }
     }
 
+    /// Writes `out` and flushes it: a TLS write may keep bytes back until a flush.
+    async fn send(&mut self, out: &[u8]) -> io::Result<()> {
+        self.stream.write_all(out).await?;
+        self.stream.flush().await
+    }
+
     /// Reads one whole message outside the relay.
     async fn read_message(&mut self) -> Result<(u8, BytesMut), ConnectError> {
         loop {
@@ -331,11 +377,13 @@ impl ServerConn {
             return true;
         }
         let mut probe = [0u8; 64];
-        match self.stream.try_read(&mut probe) {
-            Ok(_) => true,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
-            Err(_) => true,
-        }
+        let mut probe = ReadBuf::new(&mut probe);
+        // A TLS record without data, such as a session ticket, leaves the read pending; data,
+        // an alert, the end of the stream or an error completes it.
+        let mut cx = Context::from_waker(Waker::noop());
+        Pin::new(&mut self.stream)
+            .poll_read(&mut cx, &mut probe)
+            .is_ready()
     }
 
     /// One round trip: a `Sync` outside a pipeline makes the server answer `ReadyForQuery`.
@@ -343,7 +391,7 @@ impl ServerConn {
         let check = async {
             let mut out = BytesMut::new();
             protocol::sync(&mut out);
-            self.stream.write_all(&out).await?;
+            self.send(&out).await?;
             let (msg_tag, body) = self.read_message().await?;
             Ok::<_, ConnectError>(
                 msg_tag == tag::READY_FOR_QUERY
@@ -362,19 +410,32 @@ fn jitter(max: Duration) -> Duration {
     Duration::from_millis(rand::rng().random_range(0..=max.as_millis() as u64))
 }
 
-/// Sends a `CancelRequest` for a server connection and waits until the server closed the
-/// cancel connection, which it does once the cancel signal has been delivered.
-pub async fn send_cancel(key: &ServerCancelKey, limit: Duration) -> io::Result<()> {
+/// Sends a `CancelRequest` for a server connection, over TLS like the connection itself, and
+/// waits until the server closed the cancel connection, which it does once the cancel signal
+/// has been delivered.
+pub async fn send_cancel(
+    key: &ServerCancelKey,
+    tls: &ServerTls,
+    limit: Duration,
+) -> Result<(), ConnectError> {
     let send = async {
-        let mut stream = TcpStream::connect(key.addr).await?;
+        let mut stream = start_tls(TcpStream::connect(key.addr).await?, tls).await?;
         stream
             .write_all(&protocol::cancel_request(key.process_id, &key.secret))
             .await?;
+        stream.flush().await?;
         let mut sink = [0u8; 16];
-        while stream.read(&mut sink).await? != 0 {}
-        Ok(())
+        loop {
+            match stream.read(&mut sink).await {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                // The server may close the cancel connection without a TLS close_notify.
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
     };
     timeout(limit, send)
         .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| ConnectError::Timeout)?
 }

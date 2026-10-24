@@ -44,6 +44,9 @@ the server only holds as many backends as there are concurrent transactions.
    travels inside the TLS session.
 4. **Verification.** The first time a `(user, database)` pair logs in, lokaj opens a server
    connection with that password over SCRAM-SHA-256, and the server decides.
+   - Server connections always use TLS, and lokaj verifies the server certificate against
+     `server.host` with the CAs in `server.ca`. A server that declines TLS or presents another
+     certificate is refused before the password is used.
    - Server connections accept only SCRAM-SHA-256, and lokaj verifies the server signature.
      A server asking for a cleartext or MD5 password, or for none, is refused.
    - **On success**, lokaj keeps the SCRAM `ClientKey` and `ServerKey`, plus an HMAC-SHA256 of
@@ -163,6 +166,7 @@ covers a reader reboot, a failover, and the endpoint falling back to the writer.
   the cancel is dropped.
 - The cancelled server connection is discarded afterwards, so a late cancel can never hit
   another client's query.
+- lokaj sends the cancel request to the server over TLS, like the connection it cancels.
 
 ### Drain
 
@@ -197,8 +201,9 @@ new pg.Pool({ host: 'lokaj.internal', port: 6432, ssl: { ca }, user, password, d
 
 Alternatively, set `ssl: true` and add the CA through `NODE_EXTRA_CA_CERTS`.
 
-Server connections are plaintext TCP, so run lokaj in the database's private network.
-Certificates are read at startup; rotate them with a rolling restart.
+Server connections use TLS and verify the server's certificate against `server.host`, with
+the CAs in `server.ca`; for Amazon RDS and Aurora that is the RDS CA bundle. Certificates and
+CAs are read at startup; rotate them with a rolling restart.
 
 ## Admin HTTP
 
@@ -239,7 +244,7 @@ All metrics are prefixed `lokaj_`.
 | `25P03` | the client held a server connection idle for too long                       |
 | `57P03` | lokaj is draining                                                           |
 | `57P01` | lokaj is draining and the client is idle                                    |
-| `08006` | the server is unreachable, or a server connection was lost mid-transaction  |
+| `08006` | server unreachable or untrusted, or a connection lost mid-transaction      |
 | `0A000` | an unsupported message, parameter or statement, or a third set of options   |
 | `08P01` | a protocol violation                                                        |
 

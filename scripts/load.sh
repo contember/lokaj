@@ -40,6 +40,7 @@ pooler_pids=()
 cleanup() {
     for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
     docker rm -f "$container" "${poolers[@]}" >/dev/null 2>&1 || true
+    docker network rm "$container" >/dev/null 2>&1 || true
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -48,10 +49,17 @@ free_port() {
     python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
 }
 
-"$root/scripts/test-pki.sh" "$work"
-# TLS on PostgreSQL too, so the probe can tell the cost of TLS from the cost of the extra hop.
-# The server key must belong to the postgres user.
-docker run -d --name "$container" --cpuset-cpus "$pg_cpus" --shm-size 1g \
+# The container address, not a published port: docker-proxy would sit in the path, unpinned. It
+# is fixed so the server certificate can name it; the poolers verify it.
+octet=$((20 + $$ % 200))
+pg_host=172.30.$octet.10
+pg_port=5432
+docker network create --subnet "172.30.$octet.0/24" "$container" >/dev/null
+"$root/scripts/test-pki.sh" "$work" "IP:$pg_host"
+# TLS on PostgreSQL, which the poolers use and the probe compares with plaintext, so it can tell
+# the cost of TLS from the cost of the extra hop. The server key must belong to the postgres user.
+docker run -d --name "$container" --network "$container" --ip "$pg_host" \
+    --cpuset-cpus "$pg_cpus" --shm-size 1g \
     -v "$work/server.crt:/tls/server.crt:ro" -v "$work/server.key:/tls/server.key:ro" \
     -e POSTGRES_PASSWORD=postgres -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
     -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
@@ -61,9 +69,6 @@ docker run -d --name "$container" --cpuset-cpus "$pg_cpus" --shm-size 1g \
             -c ssl_key_file=/tmp/server.key "$@"' postgres \
     -c max_connections=1500 -c shared_buffers=512MB -c fsync=off \
     -c synchronous_commit=off -c full_page_writes=off -c max_wal_size=8GB >/dev/null
-# The container address, not a published port: docker-proxy would sit in the path, unpinned.
-pg_host=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container")
-pg_port=5432
 # During initdb the entrypoint's temporary server listens on the Unix socket only.
 for _ in $(seq 1 120); do
     docker exec "$container" pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null && break
@@ -100,7 +105,8 @@ auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename = \$1
 client_tls_sslmode = require
 client_tls_cert_file = /cfg/server.crt
 client_tls_key_file = /cfg/server.key
-server_tls_sslmode = disable
+server_tls_sslmode = verify-full
+server_tls_ca_file = /cfg/ca.crt
 log_connections = 0
 log_disconnections = 0
 EOF
@@ -137,6 +143,7 @@ key = "$work/server.key"
 [server]
 host = "$pg_host"
 port = $pg_port
+ca = "$work/ca.crt"
 EOF
     LOKAJ_LOG=warn taskset -c "$cpu" "$root/target/release/lokaj" "$work/lokaj-$cpu.toml" >"$work/lokaj-$cpu.log" 2>&1 &
     pids+=($!)
