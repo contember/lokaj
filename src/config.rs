@@ -109,6 +109,10 @@ pub struct PoolConfig {
     pub max_waiters: usize,
     #[serde(default = "defaults::wait_timeout", with = "humantime_serde")]
     pub wait_timeout: Duration,
+    /// Server connections being opened at once across all pools, so a failover or a rollout
+    /// does not open hundreds at the same moment.
+    #[serde(default = "defaults::max_connecting")]
+    pub max_connecting: usize,
     /// An empty pool without clients is dropped after this long.
     #[serde(default = "defaults::gc_after", with = "humantime_serde")]
     pub gc_after: Duration,
@@ -121,6 +125,7 @@ impl Default for PoolConfig {
             max_total: defaults::max_total(),
             max_waiters: defaults::max_waiters(),
             wait_timeout: defaults::wait_timeout(),
+            max_connecting: defaults::max_connecting(),
             gc_after: defaults::gc_after(),
         }
     }
@@ -244,6 +249,9 @@ mod defaults {
     pub fn wait_timeout() -> Duration {
         Duration::from_secs(5)
     }
+    pub fn max_connecting() -> usize {
+        16
+    }
     pub fn gc_after() -> Duration {
         Duration::from_secs(5 * 60)
     }
@@ -293,8 +301,10 @@ impl Config {
         if self.server.host.is_empty() {
             return invalid("server.host must not be empty");
         }
-        if self.pool.max_size == 0 || self.pool.max_total == 0 {
-            return invalid("pool.max_size and pool.max_total must be positive");
+        if self.pool.max_size == 0 || self.pool.max_total == 0 || self.pool.max_connecting == 0 {
+            return invalid(
+                "pool.max_size, pool.max_total and pool.max_connecting must be positive",
+            );
         }
         if self.pool.max_size > self.pool.max_total {
             return invalid("pool.max_size must not exceed pool.max_total");

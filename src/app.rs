@@ -104,6 +104,7 @@ impl App {
             max_size: config.pool.max_size,
             max_total: config.pool.max_total,
             max_waiters: config.pool.max_waiters,
+            max_connecting: config.pool.max_connecting,
             gc_after: config.pool.gc_after,
         };
         let pools = Pools::new(upstream, limits, metrics.clone());

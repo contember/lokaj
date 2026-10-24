@@ -148,6 +148,10 @@ transaction. Give the roles read-only privileges for a hard boundary.
     over many pools.
   - Per pool, at most `pool.max_size` server connections and `pool.max_waiters` waiting clients.
   - A client waits at most `pool.wait_timeout`, then gets `53300`.
+  - At most `pool.max_connecting` connections are being opened at once, across pools.
+  - Opening a connection is retried every 100 ms while the server is starting up (`57P03`),
+    full (`53300`) or unreachable, until `pool.wait_timeout`. The client then gets the last
+    error.
   - Across pools, at most `pool.max_total` connections. When that is full, lokaj closes the
     oldest idle connection of another pool rather than letting a client wait, also when that
     connection goes idle only while the client waits.

@@ -69,6 +69,15 @@ impl ConnectError {
         }
     }
 
+    /// Whether another attempt may soon succeed: the server is starting, full or unreachable.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ConnectError::Dns(_) | ConnectError::Io(_) | ConnectError::Timeout => true,
+            ConnectError::Server(fields) => matches!(fields.code.as_str(), "53300" | "57P03"),
+            _ => false,
+        }
+    }
+
     pub fn reason(&self) -> &'static str {
         match self {
             ConnectError::Dns(_) => "dns",

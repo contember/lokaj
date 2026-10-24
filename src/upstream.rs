@@ -167,4 +167,8 @@ impl Connector for Upstream {
     fn close(&self, conn: &mut ServerConn) {
         conn.terminate();
     }
+
+    fn transient(&self, error: &ConnectError) -> bool {
+        error.is_transient()
+    }
 }

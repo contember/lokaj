@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::metrics::{Metrics, PoolLabels, PoolStats, PoolStatsSource};
 
@@ -45,7 +45,13 @@ pub trait Connector: Send + Sync + 'static {
 
     /// Ends an idle connection the pool is about to drop, without waiting.
     fn close(&self, conn: &mut Self::Conn);
+
+    /// Whether another attempt may soon succeed: the server is starting, full or unreachable.
+    fn transient(&self, error: &Self::Error) -> bool;
 }
+
+/// Pause between attempts to open a connection after a transient error.
+const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PoolKey {
@@ -61,6 +67,8 @@ pub struct Limits {
     pub max_size: usize,
     pub max_total: usize,
     pub max_waiters: usize,
+    /// Connections being opened at once across all pools.
+    pub max_connecting: usize,
     pub gc_after: Duration,
 }
 
@@ -96,6 +104,7 @@ struct Shared<C: Connector> {
     connector: C,
     limits: Limits,
     global: Arc<Semaphore>,
+    connecting: Semaphore,
     pools: Mutex<PoolMap<C>>,
     metrics: Arc<Metrics>,
     /// Clients waiting for a global permit.
@@ -457,15 +466,36 @@ impl<C: Connector> Pool<C> {
                 }
                 Obtained::Granted(conn, slot) => return Ok(self.lease(conn, slot, false)),
                 Obtained::Slot(slot) => {
-                    let conn = self
-                        .shared
-                        .connector
-                        .open(&self.key, &self.data)
-                        .await
-                        .map_err(AcquireError::Open)?;
+                    let conn = self.open(deadline).await?;
                     return Ok(self.lease(conn, slot, true));
                 }
             }
+        }
+    }
+
+    /// Opens a connection for a slot the caller holds. Transient errors are retried until
+    /// `deadline`, and the client then gets the last one, which says more than a timeout.
+    async fn open(&self, deadline: Instant) -> Result<C::Conn, AcquireError<C::Error>> {
+        let mut last_error = None;
+        loop {
+            let _connecting = tokio::select! {
+                permit = self.shared.connecting.acquire() => permit.expect("connect semaphore is never closed"),
+                () = sleep_until(deadline) => {
+                    return Err(last_error.map_or(AcquireError::TimedOut, AcquireError::Open));
+                }
+            };
+            match self.shared.connector.open(&self.key, &self.data).await {
+                Ok(conn) => return Ok(conn),
+                Err(error)
+                    if self.shared.connector.transient(&error)
+                        && Instant::now() + RETRY_INTERVAL < deadline =>
+                {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(AcquireError::Open(error)),
+            }
+            drop(_connecting);
+            sleep(RETRY_INTERVAL).await;
         }
     }
 
@@ -551,11 +581,13 @@ impl<C: Connector> Shared<C> {
 impl<C: Connector> Pools<C> {
     pub fn new(connector: C, limits: Limits, metrics: Arc<Metrics>) -> Self {
         let global = Arc::new(Semaphore::new(limits.max_total));
+        let connecting = Semaphore::new(limits.max_connecting);
         Self {
             shared: Arc::new(Shared {
                 connector,
                 limits,
                 global,
+                connecting,
                 pools: Mutex::default(),
                 metrics,
                 permit_waiters: AtomicUsize::new(0),
@@ -705,6 +737,10 @@ mod tests {
         next_id: AtomicU64,
         opened: AtomicUsize,
         closed: AtomicUsize,
+        /// Opens for the user `flaky` that fail with a transient error first.
+        flaky: AtomicUsize,
+        connecting: AtomicUsize,
+        max_connecting: AtomicUsize,
     }
 
     impl Connector for FakeConnector {
@@ -713,9 +749,24 @@ mod tests {
         type Error = &'static str;
 
         async fn open(&self, key: &PoolKey, _: &()) -> Result<FakeConn, &'static str> {
-            tokio::task::yield_now().await;
+            let connecting = self.connecting.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_connecting.fetch_max(connecting, Ordering::SeqCst);
+            if key.user.starts_with("slow") {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            self.connecting.fetch_sub(1, Ordering::SeqCst);
             if key.user == "down" {
                 return Err("server down");
+            }
+            if key.user == "flaky"
+                && self
+                    .flaky
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err("starting up");
             }
             self.opened.fetch_add(1, Ordering::SeqCst);
             Ok(FakeConn {
@@ -747,6 +798,10 @@ mod tests {
             conn.closed = true;
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn transient(&self, error: &&'static str) -> bool {
+            *error == "starting up"
+        }
     }
 
     fn key(user: &str) -> PoolKey {
@@ -762,6 +817,7 @@ mod tests {
             max_size,
             max_total,
             max_waiters: 4,
+            max_connecting: 2,
             gc_after: Duration::from_secs(300),
         };
         Pools::new(FakeConnector::default(), limits, Arc::new(Metrics::new()))
@@ -892,6 +948,41 @@ mod tests {
         ));
         assert_eq!(pools.open_total(), 0);
         assert_eq!(pool.stats().servers_active, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_errors_are_retried_until_the_deadline() {
+        let pools = pools(1, 10);
+        let pool = pools.register(key("flaky")).unwrap();
+        pools.connector().flaky.store(3, Ordering::SeqCst);
+        let started = Instant::now();
+        pool.acquire(deadline()).await.unwrap();
+        assert_eq!(started.elapsed(), 3 * RETRY_INTERVAL);
+
+        drop(pool.acquire(deadline()).await.unwrap());
+        pools.connector().flaky.store(usize::MAX, Ordering::SeqCst);
+        let started = Instant::now();
+        assert!(matches!(
+            pool.acquire(deadline()).await,
+            Err(AcquireError::Open("starting up"))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(pools.open_total(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_are_opened_a_few_at_a_time() {
+        let pools = pools(2, 10);
+        let tasks: Vec<_> = (0..6)
+            .map(|i| {
+                let pool = pools.register(key(&format!("slow{i}"))).unwrap();
+                tokio::spawn(async move { pool.acquire(deadline()).await.is_ok() })
+            })
+            .collect();
+        for task in tasks {
+            assert!(task.await.unwrap());
+        }
+        assert_eq!(pools.connector().max_connecting.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]

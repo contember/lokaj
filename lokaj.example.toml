@@ -46,6 +46,8 @@ max_total = 300
 # Clients waiting for a server connection, per pool.
 max_waiters = 100
 wait_timeout = "5s"
+# Server connections being opened at once, across all pools.
+max_connecting = 16
 # An empty pool without clients is dropped after this long.
 gc_after = "5m"
 
