@@ -54,6 +54,9 @@ the server only holds as many backends as there are concurrent transactions.
      The verification connection joins the pool.
    - **On rejection**, the client gets the server's error (`28P01`, or `42501` for a database
      it may not connect to).
+   - A server that refuses before any password exchange, as `pg_hba.conf` does, says nothing
+     about the password: the client gets the server's `28000`, and the login does not count as
+     failed.
    - A credential is never cached before the server has accepted it.
    - At most `auth.max_verifications` verifications run at once; a login that cannot start one
      within `pool.wait_timeout` gets `53300`.

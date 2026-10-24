@@ -180,6 +180,48 @@ async fn failed_logins_lock_out_the_failing_source() {
 }
 
 #[tokio::test]
+async fn a_refusal_before_authentication_is_not_a_wrong_password() {
+    require_pg!();
+    let lokaj = Lokaj::start().await;
+    let alice = tenant().await;
+    let mut admin = admin().await;
+    admin
+        .query("do $$ begin create role refused; exception when duplicate_object then null; end $$")
+        .await
+        .unwrap();
+    admin
+        .query(&format!("grant refused to \"{}\"", alice.user))
+        .await
+        .unwrap();
+    // More refusals than auth.max_failures, and none of them locks the client out.
+    for _ in 0..6 {
+        let mut client = lokaj.client().await;
+        let error = client
+            .login(&alice.params(), &alice.password)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "28000");
+    }
+    assert_eq!(
+        lokaj
+            .metric("lokaj_server_connect_errors_total{reason=\"refused\"}")
+            .await,
+        6.0
+    );
+    assert_eq!(
+        lokaj
+            .metric("lokaj_auth_failures_total{reason=\"rejected\"}")
+            .await,
+        0.0
+    );
+    admin
+        .query(&format!("revoke refused from \"{}\"", alice.user))
+        .await
+        .unwrap();
+    lokaj.login(&alice).await;
+}
+
+#[tokio::test]
 async fn simple_and_extended_queries() {
     require_pg!();
     let lokaj = Lokaj::start().await;

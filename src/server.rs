@@ -40,6 +40,8 @@ pub enum ConnectError {
     Tls(io::Error),
     #[error("server error {}: {}", .0.code, .0.message)]
     Server(ErrorFields),
+    #[error("server refused the connection before authentication: {}", .0.message)]
+    Refused(ErrorFields),
     #[error("SCRAM authentication failed: {0}")]
     Scram(#[from] ScramError),
     #[error("server requested unsupported authentication: {0}")]
@@ -75,6 +77,7 @@ impl ConnectError {
             ConnectError::TlsRefused | ConnectError::Tls(_) => "tls",
             ConnectError::Server(_) if self.is_auth_failure() => "auth",
             ConnectError::Server(_) => "server_error",
+            ConnectError::Refused(_) => "refused",
             ConnectError::Scram(_) | ConnectError::NoCredential => "auth",
             ConnectError::UnsupportedAuth(_) => "unsupported_auth",
             ConnectError::Protocol(_) => "protocol",
@@ -317,7 +320,13 @@ impl ServerConn {
                     }
                 },
                 tag::ERROR_RESPONSE => {
-                    return Err(ConnectError::Server(protocol::parse_error_response(&body)?));
+                    let fields = protocol::parse_error_response(&body)?;
+                    // pg_hba.conf refuses before any password exchange, so it says nothing
+                    // about the password.
+                    if scram.is_none() && fields.code == "28000" {
+                        return Err(ConnectError::Refused(fields));
+                    }
+                    return Err(ConnectError::Server(fields));
                 }
                 tag::PARAMETER_STATUS => {
                     let (name, value) = protocol::parse_parameter_status(&body)?;

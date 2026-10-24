@@ -63,7 +63,9 @@ fn connect_failure(error: &ConnectError) -> Fatal {
     match error {
         // The server's own startup errors (starting up, too many connections, unknown
         // database, …) are what the client would have seen without lokaj.
-        ConnectError::Server(fields) => fatal(&fields.code, fields.message.clone()),
+        ConnectError::Server(fields) | ConnectError::Refused(fields) => {
+            fatal(&fields.code, fields.message.clone())
+        }
         error if error.is_auth_failure() => fatal("28P01", "lokaj: password authentication failed"),
         _ => fatal("08006", "lokaj: could not connect to the server"),
     }
