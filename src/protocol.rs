@@ -464,7 +464,11 @@ pub fn parse_authentication(body: &[u8]) -> Result<Authentication<'_>, ProtocolE
     let auth = match r.i32()? {
         0 => Authentication::Ok,
         3 => Authentication::CleartextPassword,
-        5 => Authentication::Md5Password,
+        5 => {
+            // The salt.
+            r.rest();
+            Authentication::Md5Password
+        }
         10 => {
             let mut mechanisms = Vec::new();
             loop {
@@ -718,6 +722,16 @@ mod tests {
         );
         body.push(0);
         assert!(parse_frontend(b'P', &body).is_err());
+    }
+
+    #[test]
+    fn md5_request_carries_a_salt() {
+        let mut body = 5i32.to_be_bytes().to_vec();
+        body.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(matches!(
+            parse_authentication(&body),
+            Ok(Authentication::Md5Password)
+        ));
     }
 
     #[test]
