@@ -149,7 +149,8 @@ transaction. Give the roles read-only privileges for a hard boundary.
   - Per pool, at most `pool.max_size` server connections and `pool.max_waiters` waiting clients.
   - A client waits at most `pool.wait_timeout`, then gets `53300`.
   - Across pools, at most `pool.max_total` connections. When that is full, lokaj closes the
-    oldest idle connection of another pool rather than letting a client wait.
+    oldest idle connection of another pool rather than letting a client wait, also when that
+    connection goes idle only while the client waits.
 - **Lifecycle.**
   - No minimum size, and no background connects: a connection is opened only for a waiting
     client.

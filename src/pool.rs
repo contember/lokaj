@@ -98,6 +98,17 @@ struct Shared<C: Connector> {
     global: Arc<Semaphore>,
     pools: Mutex<PoolMap<C>>,
     metrics: Arc<Metrics>,
+    /// Clients waiting for a global permit.
+    permit_waiters: AtomicUsize,
+}
+
+/// Counts a client as waiting for a global permit while it lives.
+struct PermitWait<'a>(&'a AtomicUsize);
+
+impl Drop for PermitWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct PoolMap<C: Connector> {
@@ -319,6 +330,12 @@ impl<C: Connector> Pool<C> {
                             slot,
                             since: Instant::now(),
                         });
+                        drop(state);
+                        // A client of another pool waits for a global permit: an idle
+                        // connection now exists, so close the oldest one for it.
+                        if self.shared.permit_waiters.load(Ordering::SeqCst) > 0 {
+                            self.shared.evict_idle(None);
+                        }
                         return;
                     }
                 }
@@ -374,7 +391,11 @@ impl<C: Connector> Pool<C> {
                 Step::NeedPermit(mut rx) => {
                     // The global limit is reached: close the oldest idle connection of another
                     // pool, or wait for a permit while staying first in line for our own pool.
-                    if self.shared.evict_idle(&self.key) {
+                    // Counted before looking, so a connection that goes idle after the look is
+                    // closed by whoever released it.
+                    self.shared.permit_waiters.fetch_add(1, Ordering::SeqCst);
+                    let _waiting = PermitWait(&self.shared.permit_waiters);
+                    if self.shared.evict_idle(Some(&self.key)) {
                         continue;
                     }
                     tokio::select! {
@@ -494,10 +515,11 @@ impl<C: Connector> Shared<C> {
             .collect()
     }
 
-    fn evict_idle(&self, except: &PoolKey) -> bool {
+    /// Closes the oldest idle connection, of any pool other than `except`.
+    fn evict_idle(&self, except: Option<&PoolKey>) -> bool {
         let mut oldest: Option<(Arc<Pool<C>>, Instant)> = None;
         for pool in self.list() {
-            if pool.key == *except {
+            if Some(&pool.key) == except {
                 continue;
             }
             let since = pool.lock().idle.first().map(|idle| idle.since);
@@ -536,6 +558,7 @@ impl<C: Connector> Pools<C> {
                 global,
                 pools: Mutex::default(),
                 metrics,
+                permit_waiters: AtomicUsize::new(0),
             }),
         }
     }
@@ -816,6 +839,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_client_waiting_for_a_global_permit_gets_the_next_idle_connection_closed() {
+        let pools = pools(1, 1);
+        let a = pools.register(key("a")).unwrap();
+        let b = pools.register(key("b")).unwrap();
+        let held = a.acquire(deadline()).await.unwrap();
+        let waiter = {
+            let b = b.clone();
+            tokio::spawn(async move { b.acquire(deadline()).await.map(|l| l.conn().key.clone()) })
+        };
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+        held.release();
+        assert_eq!(waiter.await.unwrap(), Ok(key("b")));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(a.stats().servers_idle, 0);
+        let evicted = pools
+            .shared
+            .metrics
+            .server_recycles
+            .get_or_create(&crate::metrics::Reason { reason: "evicted" })
+            .get();
+        assert_eq!(evicted, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn waiters_over_the_limit_are_refused() {
         let pools = pools(1, 10);
         let pool = pools.register(key("a")).unwrap();
@@ -976,13 +1024,17 @@ mod tests {
                         prop_assert!(ids.insert(lease.conn().id), "connection held by two clients");
                     }
                     let mut total = 0;
+                    let mut idle = 0;
                     for handle in &handles {
                         let stats = handle.stats();
                         let open = stats.servers_active + stats.servers_idle;
                         prop_assert!(open <= max_size);
                         prop_assert!(stats.servers_idle == 0 || stats.clients_waiting == 0);
                         total += open;
+                        idle += stats.servers_idle;
                     }
+                    // No client waits for a global permit while an idle connection could make room.
+                    prop_assert!(idle == 0 || pools.shared.permit_waiters.load(Ordering::SeqCst) == 0);
                     prop_assert!(total <= max_total);
                     prop_assert_eq!(total, pools.open_total());
                 }
