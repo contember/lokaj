@@ -1,0 +1,67 @@
+# Every key with its default; only `listen`, `admin_listen`, `[tls]` and `server.host` are required.
+# Durations use humantime syntax ("500ms", "30s", "5m").
+
+listen = "0.0.0.0:6432"
+admin_listen = "0.0.0.0:9930"
+# How long a drain may take before remaining clients are dropped.
+shutdown_timeout = "55s"
+
+# Client-facing TLS, mandatory: clients send their password in cleartext inside it.
+# Certificates are read at startup.
+[tls]
+cert = "/etc/lokaj/tls.crt"
+key = "/etc/lokaj/tls.key"
+
+[server]
+# Reader endpoint, resolved for every new server connection.
+host = "reader.db.internal"
+port = 5432
+application_name = "lokaj"
+connect_timeout = "5s"
+idle_timeout = "60s"
+# Each connection is recycled after `lifetime` plus a random part of `lifetime_jitter`.
+lifetime = "30m"
+lifetime_jitter = "30m"
+# A connection idle for longer than this gets a round trip before reuse.
+check_after = "30s"
+check_timeout = "2s"
+cancel_timeout = "5s"
+keepalive_time = "30s"
+dns_cache_ttl = "1s"
+dns_refresh_interval = "1s"
+# Connections to an address missing from every answer for this long are recycled.
+dns_forget_after = "15s"
+
+[pool]
+# Server connections per pool. A pool serves one (user, database) and set of startup options;
+# one database can have at most two such pools at a time.
+max_size = 10
+# Server connections across all pools.
+max_total = 300
+# Clients waiting for a server connection, per pool.
+max_waiters = 100
+wait_timeout = "5s"
+# An empty pool without clients is dropped after this long.
+gc_after = "5m"
+
+[auth]
+# A cached credential is verified with a server login again after this long.
+verify_ttl = "10m"
+# Failed logins allowed per user and client address within the window; past it, that address
+# is refused even with the right password. Also the failed server verifications allowed per
+# user across all addresses; past it, logins that need a verification fail without reaching
+# the server.
+max_failures = 5
+failure_window = "60s"
+# Password verifications against the server at once.
+max_verifications = 16
+
+[client]
+max_clients = 5000
+# From accept until the client is authenticated.
+login_timeout = "15s"
+# Largest frontend message, in bytes.
+max_message_size = 67108864
+# A client holding a server connection while the server waits for it (idle in a transaction,
+# or in an unfinished extended-protocol batch) is closed after this long.
+idle_transaction_timeout = "60s"
