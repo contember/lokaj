@@ -245,6 +245,66 @@ async fn a_refusal_before_authentication_is_not_a_wrong_password() {
 }
 
 #[tokio::test]
+async fn a_server_asking_for_md5_gets_a_clear_refusal() {
+    require_pg!();
+    let lokaj = Lokaj::start().await;
+    let alice = tenant().await;
+    let mut admin = admin().await;
+    admin
+        .query("do $$ begin create role md5; exception when duplicate_object then null; end $$")
+        .await
+        .unwrap();
+    admin
+        .query(&format!("grant md5 to \"{}\"", alice.user))
+        .await
+        .unwrap();
+    // An MD5 verifier, as roles created before SCRAM have; with a SCRAM one, md5 means SCRAM.
+    admin
+        .query("set password_encryption = 'md5'")
+        .await
+        .unwrap();
+    admin
+        .query(&format!(
+            "alter role \"{}\" password '{}'",
+            alice.user, alice.password
+        ))
+        .await
+        .unwrap();
+    let mut client = lokaj.client().await;
+    let error = client
+        .login(&alice.params(), &alice.password)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "28000", "{}", error.message);
+    assert!(error.message.contains("SCRAM-SHA-256"), "{}", error.message);
+    assert_eq!(
+        lokaj
+            .metric("lokaj_server_connect_errors_total{reason=\"unsupported_auth\"}")
+            .await,
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn a_failed_tls_handshake_is_counted() {
+    require_pg!();
+    let lokaj = Lokaj::start().await;
+    let mut client = Client::plain(lokaj.addr).await;
+    let mut request = 8i32.to_be_bytes().to_vec();
+    request.extend_from_slice(&protocol::SSL_REQUEST_CODE.to_be_bytes());
+    client.send(&request).await;
+    client.send(&[0x16; 64]).await;
+    let sample = "lokaj_client_rejects_total{reason=\"tls_handshake\"}";
+    for _ in 0..30 {
+        if lokaj.metric(sample).await == 1.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(lokaj.metric(sample).await, 1.0);
+}
+
+#[tokio::test]
 async fn simple_and_extended_queries() {
     require_pg!();
     let lokaj = Lokaj::start().await;

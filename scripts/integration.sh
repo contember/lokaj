@@ -19,9 +19,11 @@ trap cleanup EXIT
 
 "$root/scripts/test-pki.sh" "$work"
 # Roles other than the test superuser may connect over TLS only, so a server connection lokaj
-# opened without TLS would fail. Members of `refused` are turned away before authentication.
-# The server key must belong to the postgres user.
-printf '%s\n' 'local all all trust' 'hostssl all +refused all reject' 'hostssl all all all scram-sha-256' \
+# opened without TLS would fail. Members of `refused` are turned away before authentication,
+# and members of `md5` are asked for an MD5 password. The server key must belong to the
+# postgres user.
+printf '%s\n' 'local all all trust' 'hostssl all +refused all reject' 'hostssl all +md5 all md5' \
+    'hostssl all all all scram-sha-256' \
     'host all postgres all scram-sha-256' 'host all all all reject' >"$work/pg_hba.conf"
 docker run -d --name "$container" \
     -v "$work/server.crt:/tls/server.crt:ro" -v "$work/server.key:/tls/server.key:ro" \

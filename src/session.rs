@@ -42,6 +42,8 @@ type Client = TlsStream<TcpStream>;
 enum LoginError {
     #[error("client I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("TLS handshake failed: {0}")]
+    Tls(std::io::Error),
     #[error("{0}")]
     Protocol(#[from] protocol::ProtocolError),
 }
@@ -67,6 +69,10 @@ fn connect_failure(error: &ConnectError) -> Fatal {
             fatal(&fields.code, fields.message.clone())
         }
         error if error.is_auth_failure() => fatal("28P01", "lokaj: password authentication failed"),
+        ConnectError::UnsupportedAuth(method) => fatal(
+            "28000",
+            format!("lokaj: the server asked for {method}; lokaj needs SCRAM-SHA-256"),
+        ),
         _ => fatal("08006", "lokaj: could not connect to the server"),
     }
 }
@@ -201,7 +207,21 @@ pub async fn handle(app: Arc<App>, tcp: TcpStream, peer: SocketAddr) {
             return;
         }
         Ok(Err(error)) => {
-            tracing::debug!(%peer, %error, "client login failed");
+            match error {
+                // Often an expired or untrusted lokaj certificate, which every client then hits.
+                LoginError::Tls(_) => {
+                    app.metrics.client_reject("tls_handshake");
+                    tracing::info!(%peer, %error, "client TLS handshake failed");
+                }
+                LoginError::Protocol(_) => {
+                    app.metrics.client_reject("protocol");
+                    tracing::debug!(%peer, %error, "client login failed");
+                }
+                LoginError::Io(_) => {
+                    app.metrics.client_reject("disconnected");
+                    tracing::debug!(%peer, %error, "client login failed");
+                }
+            }
             return;
         }
         Ok(Ok(None)) => return,
@@ -219,7 +239,7 @@ async fn login(
         match read_startup_packet(&mut tcp).await? {
             StartupPacket::SslRequest => {
                 tcp.write_all(b"S").await?;
-                break app.tls.accept(tcp).await?;
+                break app.tls.accept(tcp).await.map_err(LoginError::Tls)?;
             }
             StartupPacket::GssEncRequest => tcp.write_all(b"N").await?,
             StartupPacket::Cancel { process_id, secret } => {
@@ -299,10 +319,8 @@ async fn login(
     let verify = || async {
         // Outside the pools: the client is not authenticated yet.
         let Ok(Ok(_permit)) = timeout(wait_timeout, app.verifications.acquire()).await else {
-            return Verification::Unavailable(fatal(
-                "53300",
-                "lokaj: too many logins are being verified",
-            ));
+            let error = fatal("53300", "lokaj: too many logins are being verified");
+            return Verification::Unavailable((error, "verification_busy"));
         };
         let secret = Secret::Password(password.as_str());
         match ServerConn::connect(
@@ -319,9 +337,10 @@ async fn login(
             Err(error) => {
                 app.metrics.connect_error(error.reason());
                 if error.is_auth_failure() {
-                    Verification::Rejected(connect_failure(&error))
+                    Verification::Rejected((connect_failure(&error), "rejected"))
                 } else {
-                    Verification::Unavailable(connect_failure(&error))
+                    tracing::warn!(user = %startup.user, database = %startup.database, %error, "cannot verify a password with the server");
+                    Verification::Unavailable((connect_failure(&error), "unavailable"))
                 }
             }
         }
@@ -342,8 +361,8 @@ async fn login(
         }
         Err(error) => {
             let error = match error {
-                AuthError::Rejected(error) => {
-                    app.metrics.auth_failure("rejected");
+                AuthError::Rejected((error, reason)) => {
+                    app.metrics.auth_failure(reason);
                     tracing::info!(user = %startup.user, database = %startup.database, "password rejected");
                     error
                 }
@@ -358,8 +377,8 @@ async fn login(
                         ),
                     )
                 }
-                AuthError::Unavailable(error) => {
-                    app.metrics.auth_failure("unavailable");
+                AuthError::Unavailable((error, reason)) => {
+                    app.metrics.auth_failure(reason);
                     error
                 }
             };

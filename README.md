@@ -260,6 +260,12 @@ All metrics are prefixed `lokaj_`.
 | `pool_clients`, `pool_clients_active`, `pool_clients_waiting` | `user`, `database` | clients logged in, assigned, waiting      |
 | `pool_servers_active`, `pool_servers_idle`              | `user`, `database` | server connections                              |
 
+`client_rejects_total` reasons include `tls_handshake` (also logged: often an expired or
+untrusted certificate), `protocol` and `disconnected`. `auth_failures_total` reasons are
+`rejected`, `rate_limited`, `verification_busy` (no verification slot within
+`pool.wait_timeout`) and `unavailable` (the server could not be asked; logged with user,
+database and error).
+
 Per-pool gauges are left out for pools that are empty. `session_errors_total` reasons:
 `wait_timeout`, `too_many_waiters` and `connect_failed` (no server connection),
 `unsupported` and `protocol` (a refused client message, also logged with user and database),
@@ -269,14 +275,14 @@ Per-pool gauges are left out for pools that are empty. `session_errors_total` re
 
 | Code    | When                                                                        |
 | ------- | --------------------------------------------------------------------------- |
-| `28000` | no TLS, or no user name                                                     |
+| `28000` | no TLS, no user name, or a server that asks for MD5 or cleartext passwords  |
 | `28P01` | wrong password, rate-limited login, or server-side authentication failure   |
 | `42622` | a user or database name longer than 63 bytes                                |
 | `53300` | pool wait timeout, too many waiters, or too many logins being verified      |
 | `25P03` | the client held a server connection idle for too long                       |
 | `57P03` | lokaj is draining                                                           |
 | `57P01` | lokaj is draining and the client is idle                                    |
-| `08006` | server unreachable or untrusted, or a connection lost mid-transaction      |
+| `08006` | server unreachable or untrusted, connection lost, or client stopped reading |
 | `0A000` | an unsupported message, parameter or statement, or a third set of options   |
 | `08P01` | a protocol violation                                                        |
 
