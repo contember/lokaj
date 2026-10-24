@@ -65,6 +65,8 @@ pub struct PoolKey {
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub max_size: usize,
+    /// Idle connections kept per pool; one released beyond that is closed.
+    pub max_idle: usize,
     pub max_total: usize,
     pub max_waiters: usize,
     /// Connections being opened at once across all pools.
@@ -333,6 +335,13 @@ impl<C: Connector> Pool<C> {
                 state.last_active = Instant::now();
                 match state.waiters.pop_front() {
                     Some(waiter) => waiter,
+                    None if state.idle.len() >= self.shared.limits.max_idle => {
+                        drop(state);
+                        self.shared.metrics.recycle("max_idle");
+                        self.shared.connector.close(&mut conn);
+                        drop((conn, slot));
+                        return;
+                    }
                     None => {
                         state.idle.push(Idle {
                             conn,
@@ -815,6 +824,7 @@ mod tests {
     fn pools(max_size: usize, max_total: usize) -> Pools<FakeConnector> {
         let limits = Limits {
             max_size,
+            max_idle: max_size,
             max_total,
             max_waiters: 4,
             max_connecting: 2,
@@ -917,6 +927,24 @@ mod tests {
             .get_or_create(&crate::metrics::Reason { reason: "evicted" })
             .get();
         assert_eq!(evicted, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_connections_beyond_max_idle_are_closed() {
+        let mut pools = pools(3, 10);
+        Arc::get_mut(&mut pools.shared).unwrap().limits.max_idle = 1;
+        let pool = pools.register(key("a")).unwrap();
+        let leases = [
+            pool.acquire(deadline()).await.unwrap(),
+            pool.acquire(deadline()).await.unwrap(),
+            pool.acquire(deadline()).await.unwrap(),
+        ];
+        for lease in leases {
+            lease.release();
+        }
+        assert_eq!(pool.stats().servers_idle, 1);
+        assert_eq!(pools.open_total(), 1);
+        assert_eq!(pools.connector().closed.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]

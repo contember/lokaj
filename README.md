@@ -160,6 +160,8 @@ transaction. Give the roles read-only privileges for a hard boundary.
     client.
   - Connections close after `server.idle_timeout` idle, or after `server.lifetime` plus random
     jitter.
+  - A pool keeps at most `pool.max_idle` idle connections (`pool.max_size` by default), and a
+    connection released beyond that is closed.
   - Server and client connections use TCP keepalive after `server.keepalive_time`, and
     `TCP_USER_TIMEOUT` closes them when sent data stays unacknowledged for 30 s longer. A peer
     that vanishes mid-query is noticed within about a minute.

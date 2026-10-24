@@ -101,6 +101,10 @@ pub struct PoolConfig {
     /// startup options; one database can have at most two such pools at a time.
     #[serde(default = "defaults::max_size")]
     pub max_size: usize,
+    /// Idle server connections kept per pool, `max_size` by default. A connection released
+    /// beyond that is closed, so the server sheds backends sooner after a burst.
+    #[serde(default)]
+    pub max_idle: Option<usize>,
     /// Maximum server connections across all pools.
     #[serde(default = "defaults::max_total")]
     pub max_total: usize,
@@ -122,6 +126,7 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             max_size: defaults::max_size(),
+            max_idle: None,
             max_total: defaults::max_total(),
             max_waiters: defaults::max_waiters(),
             wait_timeout: defaults::wait_timeout(),
@@ -308,6 +313,13 @@ impl Config {
         }
         if self.pool.max_size > self.pool.max_total {
             return invalid("pool.max_size must not exceed pool.max_total");
+        }
+        if self
+            .pool
+            .max_idle
+            .is_some_and(|max_idle| max_idle > self.pool.max_size)
+        {
+            return invalid("pool.max_idle must not exceed pool.max_size");
         }
         if self.pool.wait_timeout.is_zero() || self.server.connect_timeout.is_zero() {
             return invalid("pool.wait_timeout and server.connect_timeout must be positive");

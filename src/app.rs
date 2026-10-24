@@ -102,6 +102,7 @@ impl App {
         };
         let limits = Limits {
             max_size: config.pool.max_size,
+            max_idle: config.pool.max_idle.unwrap_or(config.pool.max_size),
             max_total: config.pool.max_total,
             max_waiters: config.pool.max_waiters,
             max_connecting: config.pool.max_connecting,

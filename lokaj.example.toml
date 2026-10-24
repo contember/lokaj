@@ -41,6 +41,8 @@ dns_forget_after = "15s"
 # Server connections per pool. A pool serves one (user, database) and set of startup options;
 # one database can have at most two such pools at a time.
 max_size = 10
+# Idle server connections kept per pool, max_size by default; beyond it, released ones close.
+# max_idle = 4
 # Server connections across all pools.
 max_total = 300
 # Clients waiting for a server connection, per pool.
