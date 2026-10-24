@@ -78,6 +78,8 @@ pub struct ServerConfig {
     pub check_timeout: Duration,
     #[serde(default = "defaults::cancel_timeout", with = "humantime_serde")]
     pub cancel_timeout: Duration,
+    /// TCP keepalive starts after this long idle. Sent data unacknowledged for this plus 30 s
+    /// closes the connection too. Applies to client connections as well.
     #[serde(default = "defaults::keepalive_time", with = "humantime_serde")]
     pub keepalive_time: Duration,
     /// How long a DNS answer is reused for new connections.

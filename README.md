@@ -148,7 +148,9 @@ transaction. Give the roles read-only privileges for a hard boundary.
     client.
   - Connections close after `server.idle_timeout` idle, or after `server.lifetime` plus random
     jitter.
-  - Connections use TCP keepalive.
+  - Server and client connections use TCP keepalive after `server.keepalive_time`, and
+    `TCP_USER_TIMEOUT` closes them when sent data stays unacknowledged for 30 s longer. A peer
+    that vanishes mid-query is noticed within about a minute.
   - A connection idle longer than `server.check_after` gets one round trip before reuse.
   - Empty pools are dropped after `pool.gc_after`.
 - **Snapshot.** When a new server connection reports different parameters, the snapshot moves

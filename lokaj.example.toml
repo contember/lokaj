@@ -30,6 +30,7 @@ lifetime_jitter = "30m"
 check_after = "30s"
 check_timeout = "2s"
 cancel_timeout = "5s"
+# Also bounds unacknowledged data, at this plus 30s; applies to client connections too.
 keepalive_time = "30s"
 dns_cache_ttl = "1s"
 dns_refresh_interval = "1s"

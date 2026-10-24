@@ -132,13 +132,22 @@ pub struct Connected {
     pub keys: ScramKeys,
 }
 
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// Keepalive, and the same bound on unacknowledged data: keepalive probes pause while data is
+/// unacknowledged, so a peer that vanished mid-query would otherwise hold on for ~15 minutes.
 pub fn keepalive(stream: &TcpStream, time: Duration) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let keepalive = TcpKeepalive::new()
         .with_time(time)
-        .with_interval(Duration::from_secs(10))
-        .with_retries(3);
-    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    let socket = SockRef::from(stream);
+    socket.set_tcp_keepalive(&keepalive)?;
+    #[cfg(target_os = "linux")]
+    socket.set_tcp_user_timeout(Some(time + KEEPALIVE_INTERVAL * KEEPALIVE_RETRIES))?;
+    Ok(())
 }
 
 /// Negotiates TLS with `SSLRequest`. Only the one-byte answer is read before the handshake, so
@@ -441,4 +450,23 @@ pub async fn send_cancel(
     timeout(limit, send)
         .await
         .map_err(|_| ConnectError::Timeout)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unacknowledged_data_is_bounded_like_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        keepalive(&stream, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            SockRef::from(&stream).tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(60))
+        );
+    }
 }
