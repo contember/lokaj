@@ -1,0 +1,9 @@
+{
+  "name": "lokaj-node-tests",
+  "private": true,
+  "type": "module",
+  "description": "node-pg compatibility suite for lokaj",
+  "dependencies": {
+    "pg": "8.20.0"
+  }
+}

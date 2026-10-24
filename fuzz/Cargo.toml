@@ -1,0 +1,44 @@
+[package]
+name = "lokaj-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+lokaj = { path = ".." }
+
+[[bin]]
+name = "frontend"
+path = "fuzz_targets/frontend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "startup"
+path = "fuzz_targets/startup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_guard"
+path = "fuzz_targets/sql_guard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backend_stream"
+path = "fuzz_targets/backend_stream.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
