@@ -197,11 +197,56 @@ impl<'a> Lexer<'a> {
             } else if b == quote {
                 if self.peek(0) == Some(quote) {
                     self.pos += 1;
+                } else if quote == b'\''
+                    && let Some(next) = self.string_continuation()
+                {
+                    // The continuation keeps the escape rules of the literal it extends.
+                    self.pos = next;
                 } else {
                     return;
                 }
             }
         }
+    }
+
+    /// The position after the opening quote of a continuation segment (`'a'` newline `'b'`), as
+    /// in PostgreSQL's `quotecontinue`: whitespace or `--` comments that include a newline.
+    fn string_continuation(&self) -> Option<usize> {
+        let is_horiz_space = |b: u8| matches!(b, b' ' | b'\t' | 0x0c | 0x0b);
+        let is_newline = |b: u8| matches!(b, b'\n' | b'\r');
+        let skip_comment = |mut pos: usize| {
+            while self.src.get(pos).is_some_and(|&b| !is_newline(b)) {
+                pos += 1;
+            }
+            pos
+        };
+        let starts_comment = |pos: usize| self.src.get(pos..pos + 2) == Some(b"--");
+        let mut pos = self.pos;
+        loop {
+            match self.src.get(pos) {
+                Some(&b) if is_horiz_space(b) => pos += 1,
+                Some(b'-') if starts_comment(pos) => pos = skip_comment(pos),
+                _ => break,
+            }
+        }
+        if !self.src.get(pos).is_some_and(|&b| is_newline(b)) {
+            return None;
+        }
+        pos += 1;
+        loop {
+            match self.src.get(pos) {
+                Some(&b) if is_horiz_space(b) || is_newline(b) => pos += 1,
+                Some(b'-') if starts_comment(pos) => {
+                    pos = skip_comment(pos);
+                    if !self.src.get(pos).is_some_and(|&b| is_newline(b)) {
+                        return None;
+                    }
+                    pos += 1;
+                }
+                _ => break,
+            }
+        }
+        (self.src.get(pos) == Some(&b'\'')).then_some(pos + 1)
     }
 
     fn skip_block_comment(&mut self) {
@@ -313,6 +358,12 @@ mod tests {
                 "\x0bDECLARE c CURSOR WITH HOLD FOR select 1",
                 "DECLARE ... WITH HOLD",
             ),
+            // A continuation segment keeps the backslash escapes of the E'' it extends.
+            ("select E''\n'\\''; SET search_path = evil; --'", "SET"),
+            (
+                "select E'' -- c\n\t-- d\r\n'\\''; PREPARE p AS select 1; --'",
+                "PREPARE",
+            ),
         ] {
             assert_eq!(rejected(sql), Some(statement), "{sql}");
         }
@@ -331,6 +382,8 @@ mod tests {
             "select 1 /* ; set x = 1 */",
             "select U&'d\\0061t; set'",
             "select a$b$ from t",
+            "select 'a'\n'; set x = 1'",
+            "select E'a'\n  'b\\'; set x = 1'",
         ] {
             assert_eq!(rejected(sql), None, "{sql}");
         }
