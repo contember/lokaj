@@ -98,6 +98,10 @@ pub fn sync() -> Vec<u8> {
     msg(b'S', &[])
 }
 
+pub fn flush() -> Vec<u8> {
+    msg(b'H', &[])
+}
+
 pub fn terminate() -> Vec<u8> {
     msg(b'X', &[])
 }

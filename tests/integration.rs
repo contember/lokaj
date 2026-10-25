@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use common::{
-    Client, Lokaj, admin, bind, execute, msg, parse, pki, query, sync, tenant, terminate,
+    Client, Lokaj, admin, bind, execute, flush, msg, parse, pki, query, sync, tenant, terminate,
 };
 use lokaj::protocol;
 
@@ -550,6 +550,33 @@ async fn a_client_idle_in_a_transaction_gives_up_its_connection() {
             .await,
         2.0
     );
+}
+
+#[tokio::test]
+async fn an_execute_the_server_still_runs_is_not_idle() {
+    require_pg!();
+    let lokaj = Lokaj::with(|c| {
+        c.client.idle_transaction_timeout = Duration::from_millis(300);
+    })
+    .await;
+    let alice = tenant().await;
+    let mut a = lokaj.login(&alice).await;
+    // node-pg's `rows` option sends Execute and Flush, and Sync only after the last page.
+    let mut out = parse("", "select pg_sleep(0.6)::text");
+    out.extend(bind("", "", &[]));
+    out.extend(execute());
+    out.extend(flush());
+    a.send(&out).await;
+    loop {
+        let (tag, _) = a.recv().await;
+        assert_ne!(tag, b'E', "the running Execute was treated as idle");
+        if tag == b'C' {
+            break;
+        }
+    }
+    a.send(&sync()).await;
+    assert_eq!(a.results().await.1, None);
+    a.query("select 1").await.unwrap();
 }
 
 #[tokio::test]

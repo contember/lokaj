@@ -42,6 +42,11 @@ pub struct Relay {
     pending: u32,
     /// Extended-protocol messages were forwarded since the last `Sync`.
     open_batch: bool,
+    /// `Execute` messages of the open batch the server has not finished. The server answers in
+    /// order, so answers that arrive while `pending > 0` belong to earlier messages.
+    executing: u32,
+    /// The server reported an error in the open batch and skips its messages up to `Sync`.
+    skipping: bool,
     status: TxStatus,
     /// The unnamed statement and portal were created in the current batch. Ones left on the
     /// connection by an earlier client must never be used, and after a `Sync` lokaj cannot know
@@ -61,6 +66,8 @@ impl Relay {
         Self {
             pending: 0,
             open_batch: false,
+            executing: 0,
+            skipping: false,
             status: TxStatus::Idle,
             unnamed_statement: false,
             unnamed_portal: false,
@@ -144,10 +151,15 @@ impl Relay {
                     ));
                 }
                 self.open_batch = true;
+                if !self.skipping {
+                    self.executing += 1;
+                }
             }
             FrontendMessage::Sync => {
                 self.pending += 1;
                 self.open_batch = false;
+                self.executing = 0;
+                self.skipping = false;
                 self.unnamed_statement = false;
                 self.unnamed_portal = false;
             }
@@ -181,13 +193,28 @@ impl Relay {
         Ok(self.can_release())
     }
 
+    /// Records a `CommandComplete`, `EmptyQueryResponse` or `PortalSuspended`.
+    pub fn on_execute_done(&mut self) {
+        if self.pending == 0 {
+            self.executing = self.executing.saturating_sub(1);
+        }
+    }
+
+    /// Records an `ErrorResponse`.
+    pub fn on_error(&mut self) {
+        if self.pending == 0 && self.open_batch {
+            self.executing = 0;
+            self.skipping = true;
+        }
+    }
+
     pub fn can_release(&self) -> bool {
         self.status == TxStatus::Idle && self.pending == 0 && !self.open_batch
     }
 
     /// Whether the server answered everything it was sent and now waits for the client.
     pub fn awaits_client(&self) -> bool {
-        self.pending == 0
+        self.pending == 0 && self.executing == 0
     }
 
     /// Whether the server may be executing something for this client.
@@ -308,6 +335,14 @@ impl BackendStream {
                         | tag::PARAMETER_DESCRIPTION
                         | tag::NOTICE_RESPONSE
                         | tag::NOTIFICATION_RESPONSE => {
+                            if matches!(
+                                msg_tag,
+                                tag::COMMAND_COMPLETE
+                                    | tag::EMPTY_QUERY_RESPONSE
+                                    | tag::PORTAL_SUSPENDED
+                            ) {
+                                relay.on_execute_done();
+                            }
                             out.extend_from_slice(&input.split_to(5));
                             self.state = StreamState::PassThrough { remaining: len };
                         }
@@ -343,6 +378,7 @@ impl BackendStream {
                             }
                         }
                         _ => {
+                            relay.on_error();
                             if protocol::parse_error_response(body)?.is_fatal() {
                                 flow = Flow::Fatal;
                             }
@@ -610,6 +646,80 @@ mod tests {
         assert_eq!(flows, vec![Flow::Fatal]);
     }
 
+    #[test]
+    fn an_execute_keeps_the_server_busy_until_it_completes() {
+        let mut relay = Relay::new();
+        for m in [
+            FrontendMessage::Parse {
+                statement: "",
+                sql: "select pg_sleep(100)",
+            },
+            FrontendMessage::Bind {
+                portal: "",
+                statement: "",
+            },
+            FrontendMessage::Execute { portal: "" },
+            FrontendMessage::Flush,
+        ] {
+            relay.on_frontend(&m).unwrap();
+        }
+        assert!(!relay.awaits_client());
+        let mut wire = msg(b'1', &[]);
+        wire.extend(msg(b'2', &[]));
+        wire.extend(msg(b'C', b"SELECT 1\0"));
+        feed_all(&wire, 3, &mut relay);
+        assert!(relay.awaits_client());
+
+        // After an error the server skips the batch up to Sync: later Executes never complete.
+        relay
+            .on_frontend(&FrontendMessage::Execute { portal: "" })
+            .unwrap();
+        assert!(!relay.awaits_client());
+        let mut error = BytesMut::new();
+        protocol::error_response(&mut error, protocol::Severity::Error, "57014", "cancelled");
+        feed_all(&error, 3, &mut relay);
+        assert!(relay.awaits_client());
+        relay
+            .on_frontend(&FrontendMessage::Execute { portal: "" })
+            .unwrap();
+        assert!(relay.awaits_client());
+    }
+
+    #[test]
+    fn answers_to_an_earlier_batch_do_not_complete_the_open_one() {
+        let mut relay = Relay::new();
+        for _ in 0..2 {
+            for m in [
+                FrontendMessage::Parse {
+                    statement: "",
+                    sql: "select 1",
+                },
+                FrontendMessage::Bind {
+                    portal: "",
+                    statement: "",
+                },
+                FrontendMessage::Execute { portal: "" },
+            ] {
+                relay.on_frontend(&m).unwrap();
+            }
+            if relay.pending == 0 {
+                relay.on_frontend(&FrontendMessage::Sync).unwrap();
+            }
+        }
+        relay.on_frontend(&FrontendMessage::Flush).unwrap();
+        let mut wire = msg(b'1', &[]);
+        wire.extend(msg(b'2', &[]));
+        wire.extend(msg(b'C', b"SELECT 1\0"));
+        wire.extend(rfq(b'I'));
+        feed_all(&wire, 4, &mut relay);
+        assert!(!relay.awaits_client());
+        let mut wire = msg(b'1', &[]);
+        wire.extend(msg(b'2', &[]));
+        wire.extend(msg(b'C', b"SELECT 1\0"));
+        feed_all(&wire, 4, &mut relay);
+        assert!(relay.awaits_client());
+    }
+
     /// A model of the server: executes forwarded messages in order and answers each `Query` and
     /// `Sync` with `ReadyForQuery` carrying its transaction status.
     #[derive(Debug, Default)]
@@ -644,17 +754,24 @@ mod tests {
             }
         }
 
-        /// Processes queued messages up to and including the next one that is answered.
-        fn answer(&mut self) -> Option<TxStatus> {
+        /// Processes queued messages up to and including the next one that is answered,
+        /// reporting completions and errors to `relay` as the server stream would.
+        fn answer(&mut self, relay: &mut Relay) -> Option<TxStatus> {
             while let Some(m) = self.queue.pop_front() {
                 match m {
                     Client::Begin | Client::Commit | Client::Select | Client::Fail => {
                         match (m, self.status()) {
-                            (_, TxStatus::Failed) if m != Client::Commit => {}
+                            (_, TxStatus::Failed) if m != Client::Commit => relay.on_error(),
                             (Client::Begin, _) => self.status = Some(TxStatus::InTransaction),
                             (Client::Commit, _) => self.status = Some(TxStatus::Idle),
-                            (Client::Fail, _) => self.fail(),
+                            (Client::Fail, _) => {
+                                self.fail();
+                                relay.on_error();
+                            }
                             _ => {}
+                        }
+                        if m != Client::Fail {
+                            relay.on_execute_done();
                         }
                         return Some(self.status());
                     }
@@ -662,14 +779,26 @@ mod tests {
                         self.skipping = false;
                         return Some(self.status());
                     }
+                    Client::Execute if !self.skipping => relay.on_execute_done(),
                     Client::ExecuteFail if !self.skipping => {
                         self.fail();
                         self.skipping = true;
+                        relay.on_error();
                     }
                     _ => {}
                 }
             }
             None
+        }
+
+        /// The server has nothing left to run and waits for the client.
+        fn awaits_client(&self) -> bool {
+            !self.answers_pending()
+                && (self.skipping
+                    || !self
+                        .queue
+                        .iter()
+                        .any(|m| matches!(m, Client::Execute | Client::ExecuteFail)))
         }
 
         fn answers_pending(&self) -> bool {
@@ -729,13 +858,14 @@ mod tests {
             let mut relay = Relay::new();
             let mut batch_open = false;
             for (m, deliver) in steps {
-                if deliver && let Some(status) = server.answer() {
+                if deliver && let Some(status) = server.answer(&mut relay) {
                     let release = relay.on_ready_for_query(status).unwrap();
                     let model = status == TxStatus::Idle && !server.answers_pending() && !batch_open;
                     prop_assert_eq!(release, model);
                     if release {
                         relay = Relay::new();
                     }
+                    prop_assert_eq!(relay.awaits_client(), server.awaits_client());
                     continue;
                 }
                 match relay.on_frontend(&frontend(m)) {
@@ -753,6 +883,7 @@ mod tests {
                 }
                 prop_assert!(!relay.can_release() || (!server.answers_pending() && server.status() == TxStatus::Idle));
                 prop_assert_eq!(relay.in_flight(), server.answers_pending() || batch_open);
+                prop_assert_eq!(relay.awaits_client(), server.awaits_client());
             }
         }
     }
