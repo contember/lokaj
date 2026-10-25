@@ -445,6 +445,7 @@ async fn login(
     };
 
     let cancel = app.cancels.register();
+    protocol::authentication_ok(&mut out);
     for (name, value) in params.iter() {
         if name != "application_name" {
             protocol::parameter_status(&mut out, name, value);

@@ -187,11 +187,12 @@ impl Client {
     /// Completes startup, answering cleartext or SCRAM authentication with `password`.
     pub async fn authenticate(&mut self, password: &str) -> Result<(), ErrorFields> {
         let mut scram = None;
+        let mut authenticated = false;
         loop {
             let (tag, body) = self.recv().await;
             match tag {
                 b'R' => match protocol::parse_authentication(&body).unwrap() {
-                    Authentication::Ok => {}
+                    Authentication::Ok => authenticated = true,
                     Authentication::CleartextPassword => {
                         let mut body = Vec::new();
                         cstr(&mut body, password);
@@ -224,7 +225,10 @@ impl Client {
                 }
                 b'K' => self.key = Some(protocol::parse_backend_key_data(&body).unwrap()),
                 b'E' => return Err(protocol::parse_error_response(&body).unwrap()),
-                b'Z' => return Ok(()),
+                b'Z' => {
+                    assert!(authenticated, "ReadyForQuery without AuthenticationOk");
+                    return Ok(());
+                }
                 b'N' | b'v' => {}
                 other => panic!("unexpected message {:?} during startup", other as char),
             }

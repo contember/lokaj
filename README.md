@@ -82,6 +82,7 @@ the server only holds as many backends as there are concurrent transactions.
    the verification connection finds a free slot in it, it joins the pool; otherwise it is
    closed.
 8. **Logged in.** The client receives:
+   - `AuthenticationOk`;
    - `ParameterStatus` from a snapshot of a real server connection of its pool;
    - a synthetic `BackendKeyData`;
    - `ReadyForQuery 'I'`.
