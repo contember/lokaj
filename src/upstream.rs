@@ -59,6 +59,9 @@ impl Snapshot {
         if conn.generation != inner.0 {
             return Err("snapshot");
         }
+        if conn.params.unguarded {
+            return Err("dirty");
+        }
         if conn.params.changed {
             if inner.1.as_deref() != Some(&conn.params.values) {
                 return Err("dirty");

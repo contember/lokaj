@@ -763,6 +763,41 @@ async fn changed_session_parameters_retire_the_connection() {
 }
 
 #[tokio::test]
+async fn changing_how_the_guard_reads_sql_retires_the_connection() {
+    require_pg!();
+    let lokaj = Lokaj::with(|c| c.pool.max_size = 1).await;
+    let alice = tenant().await;
+    let mut a = lokaj.login(&alice).await;
+    let original = a.query_one("show work_mem").await;
+    let pid = backend_pid(&mut a).await;
+    a.query("begin").await.unwrap();
+    a.query("set local standard_conforming_strings = off")
+        .await
+        .unwrap();
+    // The guard reads one literal; the server, with backslash escapes, runs a session-level SET
+    // of a parameter it does not report.
+    a.query("select '\\''; set work_mem = '7MB'; --'")
+        .await
+        .unwrap();
+    a.query("commit").await.unwrap();
+    assert_eq!(
+        a.params
+            .get("standard_conforming_strings")
+            .map(String::as_str),
+        Some("on")
+    );
+    let mut b = lokaj.login(&alice).await;
+    assert_eq!(b.query_one("show work_mem").await, original);
+    assert_ne!(backend_pid(&mut b).await, pid);
+    assert_eq!(
+        lokaj
+            .metric("lokaj_server_recycles_total{reason=\"dirty\"}")
+            .await,
+        1.0
+    );
+}
+
+#[tokio::test]
 async fn large_results_stream_through() {
     require_pg!();
     let lokaj = Lokaj::start().await;

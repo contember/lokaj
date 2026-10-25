@@ -138,6 +138,8 @@ transaction. Give the roles read-only privileges for a hard boundary.
   cancelled first);
 - a cancel request arrived during the assignment;
 - the server reported a `ParameterStatus` that differs from the pool snapshot;
+- the server reported `standard_conforming_strings` other than `on` or `client_encoding` other
+  than `UTF8` at any point during the assignment, even if the transaction reverted it;
 - the server sent a FATAL error or COPY data, or the connection is in any state other than
   clean and idle.
 
@@ -309,8 +311,9 @@ that is starting up, are passed through as the server sent them.
 - **Password change on the server.** Logins with the old password keep working from the cache
   until a new server connection is needed or `auth.verify_ttl` passes. Then the server rejects
   the cached keys, the entry is dropped, and that client gets `28P01`.
-- **String escapes.** The guard assumes the default `standard_conforming_strings = on`; clients
-  cannot change it through lokaj.
+- **String escapes.** The guard assumes `standard_conforming_strings = on` and `client_encoding =
+  UTF8`. A transaction may change them with `SET LOCAL` or `set_config(…, true)`, but its server
+  connection is then closed instead of returned to the pool.
 
 ## Development
 

@@ -22,6 +22,7 @@ use crate::cancel::ServerCancelKey;
 use crate::dns::Resolver;
 use crate::protocol::{self, Authentication, ErrorFields, TxStatus, tag};
 use crate::scram::{self, ScramClient, ScramError, ScramKeys, Secret};
+use crate::sql_guard;
 
 /// Largest message accepted from the server outside the relay (startup, health checks).
 const MAX_CONTROL_MESSAGE: usize = 1 << 20;
@@ -128,10 +129,19 @@ pub struct Params {
     pub values: BTreeMap<String, String>,
     /// Set when the server reported a change after startup.
     pub changed: bool,
+    /// Set once the server reported a parameter that `sql_guard` does not assume. Never cleared:
+    /// the guard may have let session state through, even if the parameter was reverted since.
+    pub unguarded: bool,
 }
 
 impl Params {
     pub fn set(&mut self, name: &str, value: &str) {
+        if sql_guard::ASSUMED_PARAMETERS
+            .iter()
+            .any(|&(assumed, expected)| assumed == name && expected != value)
+        {
+            self.unguarded = true;
+        }
         if self.values.get(name).map(String::as_str) != Some(value) {
             self.values.insert(name.to_owned(), value.to_owned());
             self.changed = true;
@@ -490,6 +500,18 @@ mod tests {
     use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn a_parameter_the_guard_does_not_assume_marks_the_connection_for_good() {
+        let mut params = Params::default();
+        params.set("client_encoding", "UTF8");
+        params.set("standard_conforming_strings", "on");
+        params.set("TimeZone", "UTC");
+        assert!(!params.unguarded);
+        params.set("standard_conforming_strings", "off");
+        params.set("standard_conforming_strings", "on");
+        assert!(params.unguarded);
+    }
 
     /// A server connection over TLS on loopback, and the server's end of it.
     async fn tls_conn() -> (ServerConn, tokio_rustls::server::TlsStream<TcpStream>) {

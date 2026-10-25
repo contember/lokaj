@@ -3,7 +3,14 @@
 //! Defence in depth: the read path never issues these, and a changed server-reported parameter
 //! is caught separately when the connection returns to its pool. The lexer follows PostgreSQL's
 //! rules for comments, quoted identifiers and string literals so keywords inside them are
-//! ignored. It assumes `standard_conforming_strings = on`.
+//! ignored. It assumes the server parameters in [`ASSUMED_PARAMETERS`].
+
+/// Server parameters the lexer assumes. Under other values the server splits a query string
+/// differently, so a statement the guard read as a literal may run.
+pub const ASSUMED_PARAMETERS: [(&str, &str); 2] = [
+    ("standard_conforming_strings", "on"),
+    ("client_encoding", "UTF8"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rejected {
