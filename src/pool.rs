@@ -708,7 +708,9 @@ impl<C: Connector> Pools<C> {
             let map = &mut *guard;
             let mut removed = Vec::new();
             map.by_key.retain(|_, pool| {
-                let state = pool.lock();
+                let mut state = pool.lock();
+                // A waiter that timed out leaves its sender behind until the next enqueue.
+                state.waiters.retain(|waiter| !waiter.is_closed());
                 let unused = state.clients == 0
                     && state.open == 0
                     && state.waiters.is_empty()
@@ -1058,6 +1060,23 @@ mod tests {
         tokio::time::advance(Duration::from_secs(301)).await;
         pools.reap();
         assert!(pools.list().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_collects_a_pool_whose_waiter_timed_out() {
+        let pools = pools(1, 1);
+        let a = pools.register(key("a")).unwrap();
+        let b = pools.register(key("b")).unwrap();
+        let _held = a.acquire(deadline()).await.unwrap();
+        assert!(matches!(
+            b.acquire(deadline()).await,
+            Err(AcquireError::TimedOut)
+        ));
+        drop(b);
+        tokio::time::advance(Duration::from_secs(301)).await;
+        pools.reap();
+        let keys: Vec<PoolKey> = pools.list().iter().map(|pool| pool.key.clone()).collect();
+        assert_eq!(keys, [key("a")]);
     }
 
     #[tokio::test(start_paused = true)]
