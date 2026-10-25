@@ -96,6 +96,7 @@ async function setup() {
 	writeFileSync(`${pki}/lokaj.toml`, `
 listen = "0.0.0.0:6432"
 admin_listen = "0.0.0.0:9930"
+drain_wait = "15s"
 shutdown_timeout = "20s"
 [tls]
 cert = "/etc/lokaj/server.crt"
@@ -147,6 +148,8 @@ function startLoad(tenants) {
 				host: '127.0.0.1',
 				connectionTimeoutMillis: 3000,
 				idleTimeoutMillis: 5000,
+				// Like the engine's `maxAgeMs`: the client closes its connections, so a drain loses no query.
+				maxLifetimeSeconds: 5,
 			})
 			Object.defineProperty(pool.options, 'port', { get: () => lokajPorts.pg })
 			pool.on('error', error => events.push({ t: Date.now(), ok: false, idle: true, code: error.code ?? error.message }))
@@ -172,7 +175,8 @@ function startLoad(tenants) {
 							events.push({ t: Date.now(), ok: true, standby: row.standby })
 						} catch (error) {
 							client?.release(true)
-							events.push({ t: Date.now(), ok: false, code: error.code ?? error.message })
+							// `connected`: the query failed on a connection that was already established.
+							events.push({ t: Date.now(), ok: false, connected: client !== undefined, code: error.code ?? error.message })
 						}
 						await sleep(10)
 					}
@@ -277,9 +281,11 @@ async function main() {
 		log('  in-flight transaction committed during the drain')
 		await waitFor('lokaj to exit', async () => (await docker('inspect', '-f', '{{.State.Running}}', `${id}-lokaj`)) === 'false', 25_000)
 		const drain = summarize(load.events, since)
-		const unexpected = Object.keys(drain.codes).filter(code => !['57P01', '57P03'].includes(code) && !/terminat|ECONNREFUSED|ECONNRESET|timeout/i.test(code))
-		log(`  ${JSON.stringify(drain)}`)
-		assert.deepEqual(unexpected, [], `unexpected errors during the drain: ${unexpected}`)
+		const lost = load.events.filter(e => e.t >= since && !e.ok && e.connected)
+		log(`  ${JSON.stringify(drain)}, failed on an established connection: ${lost.length}`)
+		// There is no second pooler here, so new connections keep failing until lokaj exits. A query on
+		// an established connection must not: the clients close those themselves before `drain_wait`.
+		assert.deepEqual(lost, [], 'queries failed on established connections during the drain')
 		await docker('rm', `${id}-lokaj`)
 		await startLokaj()
 		await lokajReady()

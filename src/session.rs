@@ -468,7 +468,7 @@ async fn login(
         to_client: BytesMut::new(),
         client_unflushed: false,
         active_at: Instant::now(),
-        drain: app.drain_receiver(),
+        close_idle: app.close_idle_receiver(),
     }))
 }
 
@@ -515,7 +515,7 @@ struct Session {
     client_unflushed: bool,
     /// Last time anything moved; bounds how long an assigned client may keep the server waiting.
     active_at: Instant,
-    drain: watch::Receiver<bool>,
+    close_idle: watch::Receiver<bool>,
 }
 
 /// A server connection assigned to the client.
@@ -790,14 +790,14 @@ impl Session {
                     }
                 }
                 None => {
-                    let draining = *self.drain.borrow_and_update();
-                    if draining {
+                    let close = *self.close_idle.borrow_and_update();
+                    if close {
                         Event::Drain
                     } else {
                         tokio::select! {
                             read = self.reader.read_buf(&mut self.cli_in), if self.cli_in.len() < max_message => Event::ClientRead(read),
                             sent = send_queued(&mut self.writer, &self.to_client), if !self.to_client.is_empty() || self.client_unflushed => Event::ClientSent(sent),
-                            _ = self.drain.changed() => continue,
+                            _ = self.close_idle.changed() => continue,
                         }
                     }
                 }
@@ -842,7 +842,7 @@ impl Session {
                         Ok(Flow::Release) => {
                             let done = assigned.take().expect("assigned");
                             self.release(done);
-                            if *self.drain.borrow() {
+                            if *self.close_idle.borrow() {
                                 self.queue_fatal(&fatal(
                                     "57P01",
                                     "lokaj: the pooler is shutting down",

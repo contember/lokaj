@@ -4,6 +4,8 @@
 
 listen = "0.0.0.0:6432"
 admin_listen = "0.0.0.0:9930"
+# How long a drain waits for clients to disconnect on their own before idle ones are closed.
+drain_wait = "45s"
 # How long a drain may take before remaining clients are dropped.
 shutdown_timeout = "55s"
 

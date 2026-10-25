@@ -43,6 +43,8 @@ pub struct App {
     /// Budget for password verifications against the server.
     pub verifications: Semaphore,
     drain: watch::Sender<bool>,
+    /// Set once a drain stopped waiting: idle clients are closed from then on.
+    close_idle: watch::Sender<bool>,
     clients: AtomicUsize,
 }
 
@@ -124,6 +126,7 @@ impl App {
             registry,
             verifications,
             drain: watch::channel(false).0,
+            close_idle: watch::channel(false).0,
             clients: AtomicUsize::new(0),
         }))
     }
@@ -132,8 +135,8 @@ impl App {
         *self.drain.borrow()
     }
 
-    pub fn drain_receiver(&self) -> watch::Receiver<bool> {
-        self.drain.subscribe()
+    pub fn close_idle_receiver(&self) -> watch::Receiver<bool> {
+        self.close_idle.subscribe()
     }
 
     /// Forwards a client's cancel request to the server connection it currently holds.
@@ -216,8 +219,9 @@ pub async fn run(config: Config) -> Result<(), StartError> {
     Ok(())
 }
 
-/// Serves on bound listeners until `shutdown` completes, then drains: new clients get `57P03`,
-/// idle clients `57P01`, and clients inside a transaction are closed when it ends.
+/// Serves on bound listeners until `shutdown` completes, then drains: new clients get `57P03`
+/// while connected clients are served until they disconnect. After `drain_wait`, idle clients get
+/// `57P01` and clients inside a transaction are closed when it ends.
 pub async fn serve(
     app: Arc<App>,
     listener: TcpListener,
@@ -250,11 +254,17 @@ pub async fn serve(
 
     tracing::info!(clients = app.clients.load(Ordering::SeqCst), "draining");
     app.drain.send_replace(true);
-    let deadline = Instant::now() + app.config.shutdown_timeout;
+    let started = Instant::now();
+    let close_idle_at = started + app.config.drain_wait;
+    let deadline = started + app.config.shutdown_timeout;
     while app.clients.load(Ordering::SeqCst) > 0 {
         tokio::select! {
             () = app.accept_one(&listener) => {}
             () = sleep(Duration::from_millis(100)) => {}
+            () = sleep_until(close_idle_at), if !*app.close_idle.borrow() => {
+                tracing::info!(clients = app.clients.load(Ordering::SeqCst), "closing idle clients");
+                app.close_idle.send_replace(true);
+            }
             () = sleep_until(deadline) => {
                 tracing::warn!(clients = app.clients.load(Ordering::SeqCst), "drain timed out, closing remaining clients");
                 break;

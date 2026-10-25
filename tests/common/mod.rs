@@ -389,6 +389,7 @@ pub fn base_config() -> Config {
         r#"
         listen = "127.0.0.1:0"
         admin_listen = "127.0.0.1:0"
+        drain_wait = "1s"
         shutdown_timeout = "10s"
         [tls]
         cert = "{cert}"
@@ -461,6 +462,17 @@ impl Lokaj {
     pub fn shutdown(&mut self) -> tokio::task::JoinHandle<()> {
         let _ = self.shutdown.take().unwrap().send(());
         self.task.take().unwrap()
+    }
+
+    /// Waits until `/readyz` reports the drain.
+    pub async fn until_draining(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.http("/readyz").await.0 != 503 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("lokaj did not start draining");
     }
 
     pub async fn http(&self, path: &str) -> (u16, String) {

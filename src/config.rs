@@ -34,6 +34,9 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub client: ClientConfig,
+    /// How long a drain waits for clients to disconnect on their own before idle ones are closed.
+    #[serde(default = "defaults::drain_wait", with = "humantime_serde")]
+    pub drain_wait: Duration,
     /// How long a drain may take before remaining clients are dropped.
     #[serde(default = "defaults::shutdown_timeout", with = "humantime_serde")]
     pub shutdown_timeout: Duration,
@@ -200,6 +203,9 @@ impl Default for ClientConfig {
 mod defaults {
     use std::time::Duration;
 
+    pub fn drain_wait() -> Duration {
+        Duration::from_secs(45)
+    }
     pub fn shutdown_timeout() -> Duration {
         Duration::from_secs(55)
     }
@@ -340,6 +346,9 @@ impl Config {
         if self.client.idle_transaction_timeout.is_zero() {
             return invalid("client.idle_transaction_timeout must be positive");
         }
+        if self.drain_wait > self.shutdown_timeout {
+            return invalid("drain_wait must not exceed shutdown_timeout");
+        }
         if self.client.max_clients == 0 || self.client.max_message_size < 1024 {
             return invalid(
                 "client.max_clients must be positive and client.max_message_size at least 1024",
@@ -391,5 +400,11 @@ mod tests {
     fn rejects_unknown_fields_and_invalid_limits() {
         assert!(Config::parse(&format!("{MINIMAL}\n[pool]\nmax_size = 0\n")).is_err());
         assert!(Config::parse(&format!("{MINIMAL}\n[pool]\nmax_sise = 5\n")).is_err());
+        assert!(
+            Config::parse(&format!(
+                "drain_wait = \"60s\"\nshutdown_timeout = \"55s\"\n{MINIMAL}"
+            ))
+            .is_err()
+        );
     }
 }

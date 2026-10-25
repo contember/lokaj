@@ -198,8 +198,13 @@ covers a reader reboot, a failover, and the endpoint falling back to the writer.
 On SIGTERM or SIGINT:
 - `/readyz` returns 503;
 - new clients get `57P03`;
-- idle clients get `FATAL 57P01`;
-- clients inside a transaction are closed at their next idle point.
+- connected clients are served until they disconnect, for at most `drain_wait` (45 s);
+- after that, idle clients get `FATAL 57P01` and clients inside a transaction are closed at
+  their next idle point.
+
+A client may send a query at the moment lokaj closes its idle connection, and that query fails.
+Clients that close their connections themselves, by an idle timeout and a maximum connection age
+shorter than `drain_wait`, lose no query during a drain.
 
 lokaj exits as soon as no clients remain, and at the latest after `shutdown_timeout` (55 s).
 - Give the pod a grace period of about 60 s.
@@ -281,7 +286,7 @@ Per-pool gauges are left out for pools that are empty. `session_errors_total` re
 | `53300` | pool wait timeout, too many waiters, or too many logins being verified      |
 | `25P03` | the client held a server connection idle for too long                       |
 | `57P03` | lokaj is draining                                                           |
-| `57P01` | lokaj is draining and the client is idle                                    |
+| `57P01` | lokaj is draining, `drain_wait` has passed and the client is idle           |
 | `08006` | server unreachable or untrusted, connection lost, or client stopped reading |
 | `0A000` | an unsupported message, parameter or statement, or a third set of options   |
 | `08P01` | a protocol violation                                                        |

@@ -877,7 +877,7 @@ async fn password_change_on_the_server() {
 }
 
 #[tokio::test]
-async fn drain_closes_clients_at_their_next_idle_point() {
+async fn drain_serves_clients_then_closes_them_at_their_next_idle_point() {
     require_pg!();
     let mut lokaj = Lokaj::start().await;
     let alice = tenant().await;
@@ -887,12 +887,14 @@ async fn drain_closes_clients_at_their_next_idle_point() {
     assert_eq!(lokaj.http("/readyz").await.0, 200);
 
     let stopped = lokaj.shutdown();
-    assert_eq!(idle.expect_fatal().await.code, "57P01");
-    assert_eq!(lokaj.http("/readyz").await.0, 503);
+    lokaj.until_draining().await;
     let mut late = lokaj.client().await;
     late.send_startup(&alice.params()).await;
     assert_eq!(late.expect_fatal().await.code, "57P03");
+    // Until `drain_wait` passes, connected clients are served as usual.
+    idle.query("select 1").await.unwrap();
 
+    assert_eq!(idle.expect_fatal().await.code, "57P01");
     busy.query("select 1").await.unwrap();
     busy.send(&query("commit")).await;
     let (_, error, status) = busy.results().await;
@@ -900,6 +902,24 @@ async fn drain_closes_clients_at_their_next_idle_point() {
     assert_eq!(status, b'I');
     assert_eq!(busy.expect_fatal().await.code, "57P01");
     tokio::time::timeout(Duration::from_secs(5), stopped)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn drain_ends_once_clients_disconnect_on_their_own() {
+    require_pg!();
+    let mut lokaj = Lokaj::with(|config| config.drain_wait = Duration::from_secs(8)).await;
+    let alice = tenant().await;
+    let mut client = lokaj.login(&alice).await;
+
+    let stopped = lokaj.shutdown();
+    lokaj.until_draining().await;
+    client.query("select 1").await.unwrap();
+    client.send(&terminate()).await;
+    client.expect_closed().await;
+    tokio::time::timeout(Duration::from_secs(2), stopped)
         .await
         .unwrap()
         .unwrap();
