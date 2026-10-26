@@ -61,6 +61,14 @@ fn fatal(code: &str, message: impl Into<String>) -> Fatal {
     }
 }
 
+/// What PostgreSQL answers a wrong password, for logins lokaj refuses without asking it.
+fn password_failed(user: &str) -> Fatal {
+    fatal(
+        "28P01",
+        format!("password authentication failed for user \"{user}\""),
+    )
+}
+
 fn connect_failure(error: &ConnectError) -> Fatal {
     match error {
         // The server's own startup errors (starting up, too many connections, unknown
@@ -366,16 +374,15 @@ async fn login(
                     tracing::info!(user = %startup.user, database = %startup.database, "password rejected");
                     error
                 }
+                AuthError::RejectedBefore => {
+                    app.metrics.auth_failure("rejected");
+                    tracing::info!(user = %startup.user, database = %startup.database, "password rejected again");
+                    password_failed(&startup.user)
+                }
                 AuthError::RateLimited => {
                     app.metrics.auth_failure("rate_limited");
                     tracing::warn!(user = %startup.user, database = %startup.database, %source, "login rate limited");
-                    fatal(
-                        "28P01",
-                        format!(
-                            "password authentication failed for user \"{}\"",
-                            startup.user
-                        ),
-                    )
+                    password_failed(&startup.user)
                 }
                 AuthError::Unavailable((error, reason)) => {
                     app.metrics.auth_failure(reason);

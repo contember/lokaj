@@ -72,12 +72,19 @@ the server only holds as many backends as there are concurrent transactions.
      ends one window after the last failure even if the client keeps retrying.
    - **Per user, across all addresses.** Failed and running verifications together stay below
      `auth.max_failures`. Past that, a login that needs a server verification is refused
-     without reaching the server, and the refusal counts for its address, which could otherwise
-     test guesses against the cache. Logins that match a fresh cached credential still succeed.
+     without reaching the server. The refusal counts for its address, which could otherwise
+     test guesses against the cache, unless the password matches the user's cached credential
+     that only went stale. Logins that match a fresh cached credential still succeed.
+   - **Repeated passwords.** A password the server rejected for a user and database is refused
+     for one window without asking the server again, and counts only for its address. Clients
+     still on a rotated password spend one verification between them, not one each. A
+     password the server is set back to within that window is refused until the window ends.
 
-   The second limit is a trade-off: a client that can reach lokaj from many addresses can fail
-   logins for a user on purpose and block its new verifications for one window. Clients with a
-   cached credential are not affected.
+   The second limit is a trade-off: a client that keeps failing logins with new passwords blocks
+   a user's new verifications for as long as it keeps doing so, also from a single address,
+   because both limits are `auth.max_failures`. Clients with a fresh cached credential are not
+   affected; one whose credential went stale is refused until the budget frees up, but its
+   address is not locked.
 7. **Pool.** Only now does lokaj create the client's pool, so failed logins create no pools. If
    the verification connection finds a free slot in it, it joins the pool; otherwise it is
    closed.

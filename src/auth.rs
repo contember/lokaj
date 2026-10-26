@@ -51,6 +51,8 @@ pub enum Login<T> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthError<E> {
     Rejected(E),
+    /// The server rejected this password for this user and database within the failure window.
+    RejectedBefore,
     RateLimited,
     Unavailable(E),
 }
@@ -74,6 +76,9 @@ struct Limits {
     /// Per user across sources: server verifications that failed, plus those in flight, so no
     /// number of sources or databases gets more guesses checked by the server.
     users: HashMap<String, UserLimit>,
+    /// Per user and database: MACs of passwords the server rejected, so clients retrying one,
+    /// such as pods still on a rotated password, do not spend the user's verifications.
+    rejected: HashMap<CredKey, VecDeque<([u8; 32], Instant)>>,
 }
 
 #[derive(Default)]
@@ -117,17 +122,43 @@ impl AuthCache {
         mac.finalize().into_bytes().into()
     }
 
-    fn matches_fresh(&self, key: &CredKey, mac: &[u8; 32]) -> bool {
+    /// When the server last accepted the cached credential `mac` matches, fresh or not.
+    fn cached_at(&self, key: &CredKey, mac: &[u8; 32]) -> Option<Instant> {
         let entries = self.entries.lock().expect("auth entries poisoned");
-        entries.get(key).is_some_and(|entry| {
-            bool::from(entry.mac.ct_eq(mac))
-                && entry
-                    .verified_at
-                    .lock()
-                    .expect("auth entry poisoned")
-                    .elapsed()
-                    < self.verify_ttl
+        let entry = entries.get(key)?;
+        bool::from(entry.mac.ct_eq(mac))
+            .then(|| *entry.verified_at.lock().expect("auth entry poisoned"))
+    }
+
+    fn matches_fresh(&self, key: &CredKey, mac: &[u8; 32]) -> bool {
+        self.cached_at(key, mac)
+            .is_some_and(|at| at.elapsed() < self.verify_ttl)
+    }
+
+    fn rejected_before(&self, key: &CredKey, mac: &[u8; 32]) -> bool {
+        let mut limits = self.limits();
+        let Some(macs) = limits.rejected.get_mut(key) else {
+            return false;
+        };
+        while macs
+            .front()
+            .is_some_and(|(_, at)| at.elapsed() >= self.failure_window)
+        {
+            macs.pop_front();
+        }
+        macs.iter().fold(false, |found, (rejected, _)| {
+            found | bool::from(rejected.ct_eq(mac))
         })
+    }
+
+    fn record_rejection(&self, key: &CredKey, mac: [u8; 32]) {
+        let mut limits = self.limits();
+        let macs = limits.rejected.entry(key.clone()).or_default();
+        macs.push_back((mac, Instant::now()));
+        // Each one cost a verification, of which the user gets max_failures per window.
+        while macs.len() > self.max_failures {
+            macs.pop_front();
+        }
     }
 
     fn limits(&self) -> std::sync::MutexGuard<'_, Limits> {
@@ -192,14 +223,25 @@ impl AuthCache {
         if self.matches_fresh(key, &mac) {
             return Ok(Login::Cached);
         }
+        if self.rejected_before(key, &mac) {
+            self.record_source_failure(&key.user, source);
+            return Err(AuthError::RejectedBefore);
+        }
         let single_flight = SingleFlight::join(self, key);
         let _turn = single_flight.lock.lock().await;
         if self.matches_fresh(key, &mac) {
             return Ok(Login::Cached);
         }
-        let Some(mut verifying) = self.begin_verification(&key.user) else {
-            // Counted, or a source could test guesses against the cache for free.
+        if self.rejected_before(key, &mac) {
             self.record_source_failure(&key.user, source);
+            return Err(AuthError::RejectedBefore);
+        }
+        let Some(mut verifying) = self.begin_verification(&key.user) else {
+            // A guess is counted, or a source could test guesses against the cache for free.
+            // The password of a credential that only went stale is not a guess.
+            if self.cached_at(key, &mac).is_none() {
+                self.record_source_failure(&key.user, source);
+            }
             return Err(AuthError::RateLimited);
         };
         match verify().await {
@@ -218,6 +260,7 @@ impl AuthCache {
             Verification::Rejected(error) => {
                 verifying.failed = true;
                 self.record_source_failure(&key.user, source);
+                self.record_rejection(key, mac);
                 // The server no longer accepts this password, so a cached copy is stale.
                 let mut entries = self.entries.lock().expect("auth entries poisoned");
                 if entries
@@ -272,6 +315,9 @@ impl AuthCache {
         limits
             .users
             .retain(|_, limit| limit.verifying > 0 || recent(&limit.failures));
+        limits
+            .rejected
+            .retain(|_, macs| macs.back().is_some_and(|(_, at)| at.elapsed() < window));
     }
 }
 
@@ -406,9 +452,11 @@ mod tests {
         login_from(&cache, OTHER_POD, &alice, "pw", "pw")
             .await
             .unwrap();
-        for _ in 0..3 {
+        for i in 0..3 {
             assert_eq!(
-                login(&cache, &alice, "guess", "pw").await.unwrap_err(),
+                login(&cache, &alice, &format!("guess{i}"), "pw")
+                    .await
+                    .unwrap_err(),
                 AuthError::Rejected(())
             );
         }
@@ -457,12 +505,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_lock_ends_one_window_after_the_last_rejection_while_the_client_retries() {
         let cache = cache();
-        for _ in 0..3 {
+        for expected in [
+            AuthError::Rejected(()),
+            AuthError::RejectedBefore,
+            AuthError::RejectedBefore,
+        ] {
             assert_eq!(
                 login(&cache, &key("alice"), "old", "new")
                     .await
                     .unwrap_err(),
-                AuthError::Rejected(())
+                expected
             );
         }
         assert_eq!(
@@ -478,8 +530,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_spent_user_budget_holds_off_another_source_for_one_window() {
         let cache = cache();
-        for _ in 0..3 {
-            login_from(&cache, OTHER_POD, &key("alice"), "old", "new")
+        for i in 0..3 {
+            login_from(&cache, OTHER_POD, &key("alice"), &format!("old{i}"), "new")
                 .await
                 .unwrap_err();
         }
@@ -488,6 +540,78 @@ mod tests {
             retry_until_verified(&cache, POD, "new").await,
             Duration::from_secs(60)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_password_is_answered_without_the_server() {
+        let cache = cache();
+        let alice = key("alice");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let attempt = |source, password: &'static str| {
+            let calls = &calls;
+            let cache = &cache;
+            let alice = &alice;
+            async move {
+                cache
+                    .authenticate(alice, source, password, || async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if password == "new" {
+                            Verification::Accepted(keys(), ())
+                        } else {
+                            Verification::<(), ()>::Rejected(())
+                        }
+                    })
+                    .await
+            }
+        };
+        assert_eq!(
+            attempt(POD, "old").await.unwrap_err(),
+            AuthError::Rejected(())
+        );
+        // Pods still on a rotated password keep retrying it from many addresses.
+        for i in 0..20u8 {
+            let source = IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, i));
+            assert_eq!(
+                attempt(source, "old").await.unwrap_err(),
+                AuthError::RejectedBefore
+            );
+        }
+        assert!(matches!(
+            attempt(OTHER_POD, "new").await,
+            Ok(Login::Verified(()))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // A rejection is remembered for one window.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_eq!(
+            attempt(OTHER_POD, "old").await.unwrap_err(),
+            AuthError::Rejected(())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_credential_refused_for_a_spent_budget_does_not_lock_its_source() {
+        let cache = cache();
+        let alice = key("alice");
+        login(&cache, &alice, "pw", "pw").await.unwrap();
+        tokio::time::advance(Duration::from_secs(601)).await;
+        for i in 0..3 {
+            login_from(&cache, OTHER_POD, &alice, &format!("guess{i}"), "pw")
+                .await
+                .unwrap_err();
+        }
+        for _ in 0..5 {
+            assert_eq!(
+                login(&cache, &alice, "pw", "pw").await.unwrap_err(),
+                AuthError::RateLimited
+            );
+        }
+        assert!(!cache.source_locked("alice", POD));
+        // A guess is still counted.
+        for _ in 0..3 {
+            login(&cache, &alice, "guess", "pw").await.unwrap_err();
+        }
+        assert!(cache.source_locked("alice", POD));
     }
 
     #[tokio::test(start_paused = true)]
@@ -638,10 +762,13 @@ mod tests {
             let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
             rt.block_on(async {
                 let ttl = Duration::from_secs(600);
-                let cache = AuthCache::new(ttl, 1000, Duration::from_secs(60));
+                let window = Duration::from_secs(60);
+                let cache = AuthCache::new(ttl, 1000, window);
                 let mut server = [0u8, 1, 2];
                 // Per user: the last password the server accepted, and when.
                 let mut accepted: [Option<(u8, Instant)>; 3] = [None; 3];
+                // Per user: passwords the server rejected, and when.
+                let mut rejected: [Vec<(u8, Instant)>; 3] = Default::default();
                 for op in ops {
                     match op {
                         Op::Login { user, password } => {
@@ -657,8 +784,12 @@ mod tests {
                                     prop_assert_eq!(p, password);
                                     prop_assert!(at.elapsed() < ttl);
                                 }
+                                Err(AuthError::RejectedBefore) => {
+                                    prop_assert!(rejected[u].iter().any(|&(p, at)| p == password && at.elapsed() < window));
+                                }
                                 Err(_) => {
                                     prop_assert_ne!(password, server[u]);
+                                    rejected[u].push((password, Instant::now()));
                                     if accepted[u].is_some_and(|(p, _)| p == password) {
                                         accepted[u] = None;
                                     }
