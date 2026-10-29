@@ -1,8 +1,15 @@
 //! Pools of server connections, one per `(user, database, startup options)`.
 //!
 //! Every server connection is tied to the pool that opened it through its [`Slot`]: it can only
-//! ever be handed to clients of that pool, and dropping it frees the slot for the pool's next
-//! waiter. Connections are only opened for a waiting client, never in the background.
+//! ever be handed to clients of that pool, and dropping it frees the slot for the pool to reuse.
+//!
+//! A client without an idle connection joins the pool's queue; it never opens a connection
+//! itself. Whichever comes first, a connection another client releases or a new one, goes to
+//! the oldest waiter. The pool opens only as many connections as the waiters cannot be served
+//! without, judged by how long its clients hold a connection and how long a new one takes to
+//! open (see [`crate::demand`]): a burst of short queries waits a few milliseconds for
+//! releases rather than ~50 ms for a new connection each. Connections are opened only while
+//! clients wait, never ahead of demand.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -13,6 +20,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, sleep, sleep_until};
 
+use crate::demand::{self, ConnectTime, Holds, Peaks};
 use crate::metrics::{GlobalStats, Metrics, PoolLabels, PoolStats, PoolStatsSource};
 
 pub trait Connector: Send + Sync + 'static {
@@ -52,6 +60,10 @@ pub trait Connector: Send + Sync + 'static {
 
 /// Pause between attempts to open a connection after a transient error.
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// How often an open waiting for a global permit checks that clients still wait for it.
+const PERMIT_RECHECK: Duration = Duration::from_millis(50);
+/// An idle connection beyond the pool's recent peak is closed once idle this long.
+const SURPLUS_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PoolKey {
@@ -111,6 +123,11 @@ struct Shared<C: Connector> {
     metrics: Arc<Metrics>,
     /// Clients waiting for a global permit.
     permit_waiters: AtomicUsize,
+    /// Holds across all pools, for pools that have not recorded enough of their own.
+    holds: Mutex<Holds>,
+    connect_time: Mutex<ConnectTime>,
+    /// Origin of the [`Peaks`] windows.
+    epoch: Instant,
 }
 
 /// Counts a client as waiting for a global permit while it lives.
@@ -159,9 +176,25 @@ struct State<C: Connector> {
     idle: Vec<Idle<C>>,
     /// Connections holding a slot: idle, leased or being opened.
     open: usize,
-    waiters: VecDeque<oneshot::Sender<Grant<C>>>,
+    /// Opens in progress, including those still waiting for a global permit.
+    opening: usize,
+    /// Of `opening`, those without a permit yet; they count against `max_size` too.
+    reserved: usize,
+    waiters: VecDeque<Waiter<C>>,
+    /// When each current lease started, by lease id.
+    leases: HashMap<u64, Instant>,
+    next_lease: u64,
+    holds: Holds,
+    peaks: Peaks,
+    /// A deferred look at the queue is scheduled.
+    replan_scheduled: bool,
     clients: usize,
     last_active: Instant,
+}
+
+struct Waiter<C: Connector> {
+    tx: oneshot::Sender<Grant<C>>,
+    deadline: Instant,
 }
 
 struct Idle<C: Connector> {
@@ -171,12 +204,13 @@ struct Idle<C: Connector> {
 }
 
 enum Grant<C: Connector> {
-    Conn(C::Conn, Slot<C>),
-    Slot(Slot<C>),
+    Conn(C::Conn, Slot<C>, Source),
+    /// Opening a connection failed for good, and this waiter is the one to hear why.
+    Failed(C::Error),
 }
 
 /// The right to hold one server connection in a pool, backed by a global permit. Dropping it
-/// passes it to the pool's next waiter or gives the permit back.
+/// gives the permit back and lets the pool reconsider its waiters.
 pub struct Slot<C: Connector> {
     pool: Arc<Pool<C>>,
     permit: Option<OwnedSemaphorePermit>,
@@ -196,6 +230,7 @@ pub struct Lease<C: Connector> {
     pool: Arc<Pool<C>>,
     inner: Option<(C::Conn, Slot<C>)>,
     pub source: Source,
+    id: u64,
 }
 
 /// Where a lease's connection came from.
@@ -205,7 +240,7 @@ pub enum Source {
     Idle,
     /// Another client released it while this one waited.
     Released,
-    /// Opened for this lease.
+    /// Opened while this client waited.
     New,
 }
 
@@ -234,13 +269,17 @@ impl<C: Connector> Lease<C> {
 
     pub fn release(mut self) {
         let (conn, slot) = self.inner.take().expect("lease is live");
+        self.pool.lease_ended(self.id);
         // A connection only ever returns to the pool its slot belongs to.
-        slot.pool.clone().put_back(conn, slot);
+        slot.pool.clone().put_back(conn, slot, Source::Released);
     }
 }
 
 impl<C: Connector> Drop for Lease<C> {
     fn drop(&mut self) {
+        if self.inner.is_some() {
+            self.pool.lease_ended(self.id);
+        }
         self.pool.leased.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -265,20 +304,9 @@ impl<C: Connector> Drop for PoolHandle<C> {
     }
 }
 
-enum Obtained<C: Connector> {
-    Idle(Idle<C>),
-    Slot(Slot<C>),
-    Granted(C::Conn, Slot<C>),
-}
-
-enum Step<C: Connector> {
-    Got(Obtained<C>),
-    NeedPermit(oneshot::Receiver<Grant<C>>),
-    Wait(oneshot::Receiver<Grant<C>>),
-}
-
-// Locking: the pool map before a pool's state; a pool's state is never held while another
-// pool's state is locked, while awaiting, or while a `Slot` is dropped (its drop locks it).
+// Locking: the pool map before a pool's state, and a pool's state before the shared statistics;
+// a pool's state is never held while another pool's state is locked, while awaiting, or while
+// a `Slot` is dropped (its drop locks it).
 impl<C: Connector> Pool<C> {
     fn lock(&self) -> MutexGuard<'_, State<C>> {
         self.state.lock().expect("pool state poisoned")
@@ -294,10 +322,39 @@ impl<C: Connector> Pool<C> {
 
     fn lease(self: &Arc<Self>, conn: C::Conn, slot: Slot<C>, source: Source) -> Lease<C> {
         self.leased.fetch_add(1, Ordering::Relaxed);
+        let window = self.shared.window();
+        let id = {
+            let mut state = self.lock();
+            let id = state.next_lease;
+            state.next_lease += 1;
+            state.leases.insert(id, Instant::now());
+            let leased = state.leases.len();
+            state.peaks.record(window, leased);
+            id
+        };
         Lease {
             pool: self.clone(),
             inner: Some((conn, slot)),
             source,
+            id,
+        }
+    }
+
+    fn lease_ended(&self, id: u64) {
+        let hold = {
+            let mut state = self.lock();
+            let hold = state.leases.remove(&id).map(|started| started.elapsed());
+            if let Some(hold) = hold {
+                state.holds.record(hold);
+            }
+            hold
+        };
+        if let Some(hold) = hold {
+            self.shared
+                .holds
+                .lock()
+                .expect("holds poisoned")
+                .record(hold);
         }
     }
 
@@ -306,7 +363,7 @@ impl<C: Connector> Pool<C> {
     pub fn try_adopt(self: &Arc<Self>, conn: C::Conn) -> Option<Lease<C>> {
         let slot = {
             let mut state = self.lock();
-            if state.open >= self.shared.limits.max_size {
+            if state.open + state.reserved >= self.shared.limits.max_size {
                 return None;
             }
             let permit = self.shared.global.clone().try_acquire_owned().ok()?;
@@ -319,36 +376,15 @@ impl<C: Connector> Pool<C> {
         Some(self.lease(conn, slot, Source::New))
     }
 
-    fn slot_freed(self: &Arc<Self>, mut permit: OwnedSemaphorePermit) {
-        loop {
-            let waiter = {
-                let mut state = self.lock();
-                match state.waiters.pop_front() {
-                    Some(waiter) => waiter,
-                    None => {
-                        state.open -= 1;
-                        return;
-                    }
-                }
-            };
-            let slot = Slot {
-                pool: self.clone(),
-                permit: Some(permit),
-            };
-            match waiter.send(Grant::Slot(slot)) {
-                Ok(()) => return,
-                Err(grant) => {
-                    permit = grant
-                        .into_slot()
-                        .permit
-                        .take()
-                        .expect("unsent slot keeps its permit")
-                }
-            }
-        }
+    fn slot_freed(self: &Arc<Self>, permit: OwnedSemaphorePermit) {
+        self.lock().open -= 1;
+        drop(permit);
+        // A waiter may have counted on the connection this slot held.
+        self.plan();
     }
 
-    fn put_back(self: &Arc<Self>, mut conn: C::Conn, mut slot: Slot<C>) {
+    /// Hands a connection to the oldest waiter, or keeps it idle.
+    fn put_back(self: &Arc<Self>, mut conn: C::Conn, mut slot: Slot<C>, source: Source) {
         loop {
             let waiter = {
                 let mut state = self.lock();
@@ -378,7 +414,7 @@ impl<C: Connector> Pool<C> {
                     }
                 }
             };
-            match waiter.send(Grant::Conn(conn, slot)) {
+            match waiter.tx.send(Grant::Conn(conn, slot, source)) {
                 Ok(()) => return,
                 Err(grant) => (conn, slot) = grant.into_conn(),
             }
@@ -388,93 +424,34 @@ impl<C: Connector> Pool<C> {
     fn enqueue(
         &self,
         state: &mut State<C>,
+        deadline: Instant,
     ) -> Result<oneshot::Receiver<Grant<C>>, AcquireError<C::Error>> {
-        state.waiters.retain(|waiter| !waiter.is_closed());
+        state.waiters.retain(|waiter| !waiter.tx.is_closed());
         if state.waiters.len() >= self.shared.limits.max_waiters {
             return Err(AcquireError::TooManyWaiters);
         }
         let (tx, rx) = oneshot::channel();
-        state.waiters.push_back(tx);
+        state.waiters.push_back(Waiter { tx, deadline });
         Ok(rx)
     }
 
-    async fn obtain(
-        self: &Arc<Self>,
-        deadline: Instant,
-    ) -> Result<Obtained<C>, AcquireError<C::Error>> {
-        let max_size = self.shared.limits.max_size;
-        loop {
-            let step = {
-                let mut state = self.lock();
-                state.last_active = Instant::now();
-                if let Some(idle) = state.idle.pop() {
-                    Step::Got(Obtained::Idle(idle))
-                } else if state.open < max_size
-                    && let Ok(permit) = self.shared.global.clone().try_acquire_owned()
-                {
-                    state.open += 1;
-                    Step::Got(Obtained::Slot(Slot {
-                        pool: self.clone(),
-                        permit: Some(permit),
-                    }))
-                } else if state.open < max_size {
-                    Step::NeedPermit(self.enqueue(&mut state)?)
-                } else {
-                    Step::Wait(self.enqueue(&mut state)?)
-                }
-            };
-            let rx = match step {
-                Step::Got(obtained) => return Ok(obtained),
-                Step::Wait(rx) => rx,
-                Step::NeedPermit(mut rx) => {
-                    // The global limit is reached: close the oldest idle connection of another
-                    // pool, or wait for a permit while staying first in line for our own pool.
-                    // Counted before looking, so a connection that goes idle after the look is
-                    // closed by whoever released it.
-                    self.shared.permit_waiters.fetch_add(1, Ordering::SeqCst);
-                    let _waiting = PermitWait(&self.shared.permit_waiters);
-                    if self.shared.evict_idle(Some(&self.key)) {
-                        continue;
-                    }
-                    tokio::select! {
-                        biased;
-                        grant = &mut rx => match grant {
-                            Ok(grant) => return Ok(grant.into_obtained()),
-                            Err(_) => continue,
-                        },
-                        permit = self.shared.global.clone().acquire_owned() => {
-                            let permit = permit.expect("global semaphore is never closed");
-                            let mut state = self.lock();
-                            if state.open < max_size {
-                                state.open += 1;
-                                drop(state);
-                                return Ok(Obtained::Slot(Slot { pool: self.clone(), permit: Some(permit) }));
-                            }
-                            continue;
-                        }
-                        () = sleep_until(deadline) => return Err(AcquireError::TimedOut),
-                    }
-                }
-            };
-            tokio::select! {
-                grant = rx => match grant {
-                    Ok(grant) => return Ok(grant.into_obtained()),
-                    Err(_) => continue,
-                },
-                () = sleep_until(deadline) => return Err(AcquireError::TimedOut),
-            }
-        }
-    }
-
-    /// A connection for one client: an idle one that passes revalidation, one released by
-    /// another client, or a new one.
+    /// A connection for one client: an idle one that passes revalidation, or the first one
+    /// available to the pool's queue, released by another client or newly opened.
     pub async fn acquire(
         self: &Arc<Self>,
         deadline: Instant,
     ) -> Result<Lease<C>, AcquireError<C::Error>> {
         loop {
-            match self.obtain(deadline).await? {
-                Obtained::Idle(Idle {
+            let taken = {
+                let mut state = self.lock();
+                state.last_active = Instant::now();
+                match state.idle.pop() {
+                    Some(idle) => Ok(idle),
+                    None => Err(self.enqueue(&mut state, deadline)?),
+                }
+            };
+            match taken {
+                Ok(Idle {
                     mut conn,
                     slot,
                     since,
@@ -493,41 +470,198 @@ impl<C: Connector> Pool<C> {
                         }
                     }
                 }
-                Obtained::Granted(conn, slot) => {
-                    return Ok(self.lease(conn, slot, Source::Released));
-                }
-                Obtained::Slot(slot) => {
-                    let conn = self.open(deadline).await?;
-                    return Ok(self.lease(conn, slot, Source::New));
+                Err(rx) => {
+                    self.plan();
+                    tokio::select! {
+                        biased;
+                        grant = rx => match grant {
+                            Ok(Grant::Conn(conn, slot, source)) => return Ok(self.lease(conn, slot, source)),
+                            Ok(Grant::Failed(error)) => return Err(AcquireError::Open(error)),
+                            Err(_) => continue,
+                        },
+                        () = sleep_until(deadline) => return Err(AcquireError::TimedOut),
+                    }
                 }
             }
         }
     }
 
-    /// Opens a connection for a slot the caller holds. Transient errors are retried until
-    /// `deadline`, and the client then gets the last one, which says more than a timeout.
-    async fn open(&self, deadline: Instant) -> Result<C::Conn, AcquireError<C::Error>> {
-        let mut last_error = None;
-        loop {
-            let _connecting = tokio::select! {
-                permit = self.shared.connecting.acquire() => permit.expect("connect semaphore is never closed"),
-                () = sleep_until(deadline) => {
-                    return Err(last_error.map_or(AcquireError::TimedOut, AcquireError::Open));
-                }
+    /// Opens the connections the queue needs now, and looks again shortly while clients wait.
+    fn plan(self: &Arc<Self>) {
+        let connect = self
+            .shared
+            .connect_time
+            .lock()
+            .expect("connect time poisoned")
+            .estimate();
+        let (opens, replan) = {
+            let mut state = self.lock();
+            state.waiters.retain(|waiter| !waiter.tx.is_closed());
+            let waiting = state.waiters.len();
+            if waiting == 0 {
+                return;
+            }
+            let holds = if state.holds.weight() >= demand::MIN_WEIGHT {
+                state.holds.clone()
+            } else {
+                self.shared.holds.lock().expect("holds poisoned").clone()
             };
+            let now = Instant::now();
+            let patience = demand::patience(connect);
+            let ending: f64 = state
+                .leases
+                .values()
+                .map(|started| holds.ends_within(now - *started, patience))
+                .sum();
+            let hold = Duration::from_secs_f64(holds.mean());
+            let room = self.shared.limits.max_size - (state.open + state.reserved);
+            let opens =
+                demand::opens_needed(waiting, state.opening, ending, hold, connect, patience)
+                    .min(room);
+            state.opening += opens;
+            state.reserved += opens;
+            let replan = waiting > state.opening && !state.replan_scheduled;
+            state.replan_scheduled |= replan;
+            (opens, replan)
+        };
+        for _ in 0..opens {
+            tokio::spawn(self.clone().open_for_queue());
+        }
+        if replan {
+            let pool = self.clone();
+            let after = (connect / 8).clamp(Duration::from_millis(1), Duration::from_millis(20));
+            tokio::spawn(async move {
+                sleep(after).await;
+                pool.lock().replan_scheduled = false;
+                pool.plan();
+            });
+        }
+    }
+
+    /// One planned open: a global permit, then a connection for whoever waits when it is ready.
+    async fn open_for_queue(self: Arc<Self>) {
+        let Some(permit) = self.permit().await else {
+            let mut state = self.lock();
+            state.reserved -= 1;
+            state.opening -= 1;
+            return;
+        };
+        {
+            let mut state = self.lock();
+            state.reserved -= 1;
+            state.open += 1;
+        }
+        let slot = Slot {
+            pool: self.clone(),
+            permit: Some(permit),
+        };
+        let started = Instant::now();
+        let opened = self.open().await;
+        self.lock().opening -= 1;
+        match opened {
+            Ok(conn) => {
+                self.shared
+                    .connect_time
+                    .lock()
+                    .expect("connect time poisoned")
+                    .record(started.elapsed());
+                self.put_back(conn, slot, Source::New);
+                self.plan();
+            }
+            Err(error) => {
+                // The waiter hears first, so the freed slot does not open again on its behalf.
+                self.fail_oldest(error);
+                drop(slot);
+            }
+        }
+    }
+
+    /// A global permit, closing another pool's idle connection for it if needed; `None` once
+    /// no client waits for this pool any more.
+    async fn permit(&self) -> Option<OwnedSemaphorePermit> {
+        loop {
+            if let Ok(permit) = self.shared.global.clone().try_acquire_owned() {
+                return Some(permit);
+            }
+            if !self.has_waiters() {
+                return None;
+            }
+            // Counted before looking, so a connection that goes idle after the look is closed
+            // by whoever released it.
+            self.shared.permit_waiters.fetch_add(1, Ordering::SeqCst);
+            let _waiting = PermitWait(&self.shared.permit_waiters);
+            if self.shared.evict_idle(Some(&self.key)) {
+                continue;
+            }
+            tokio::select! {
+                permit = self.shared.global.clone().acquire_owned() => {
+                    return Some(permit.expect("global semaphore is never closed"));
+                }
+                () = sleep(PERMIT_RECHECK) => {}
+            }
+        }
+    }
+
+    fn has_waiters(&self) -> bool {
+        let mut state = self.lock();
+        state.waiters.retain(|waiter| !waiter.tx.is_closed());
+        !state.waiters.is_empty()
+    }
+
+    /// Opens a connection. Transient errors are retried while a waiter's deadline allows; the
+    /// oldest waiter then gets the last one, which says more than a timeout.
+    async fn open(&self) -> Result<C::Conn, C::Error> {
+        loop {
+            let _connecting = self
+                .shared
+                .connecting
+                .acquire()
+                .await
+                .expect("connect semaphore is never closed");
             match self.shared.connector.open(&self.key, &self.data).await {
                 Ok(conn) => return Ok(conn),
-                Err(error)
-                    if self.shared.connector.transient(&error)
-                        && Instant::now() + RETRY_INTERVAL < deadline =>
-                {
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(AcquireError::Open(error)),
+                Err(error) if self.shared.connector.transient(&error) && self.can_retry() => {}
+                Err(error) => return Err(error),
             }
             drop(_connecting);
             sleep(RETRY_INTERVAL).await;
         }
+    }
+
+    fn can_retry(&self) -> bool {
+        let retry_at = Instant::now() + RETRY_INTERVAL;
+        self.lock()
+            .waiters
+            .iter()
+            .any(|waiter| !waiter.tx.is_closed() && waiter.deadline > retry_at)
+    }
+
+    fn fail_oldest(&self, mut error: C::Error) {
+        loop {
+            let Some(waiter) = self.lock().waiters.pop_front() else {
+                return;
+            };
+            match waiter.tx.send(Grant::Failed(error)) {
+                Ok(()) => return,
+                Err(grant) => error = grant.into_error(),
+            }
+        }
+    }
+
+    /// Closes idle connections beyond what the pool needed at once lately.
+    fn close_surplus(&self, window: u64) -> Vec<Idle<C>> {
+        let mut state = self.lock();
+        let keep = state.peaks.recent(window).max(1);
+        let mut surplus = Vec::new();
+        while state.open - surplus.len() > keep
+            && state
+                .idle
+                .first()
+                .is_some_and(|idle| idle.since.elapsed() >= SURPLUS_AFTER)
+        {
+            surplus.push(state.idle.remove(0));
+        }
+        surplus
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -535,7 +669,7 @@ impl<C: Connector> Pool<C> {
         PoolStats {
             clients: state.clients,
             clients_active: self.leased.load(Ordering::Relaxed),
-            clients_waiting: state.waiters.iter().filter(|w| !w.is_closed()).count(),
+            clients_waiting: state.waiters.iter().filter(|w| !w.tx.is_closed()).count(),
             servers_active: state.open - state.idle.len(),
             servers_idle: state.idle.len(),
         }
@@ -543,24 +677,17 @@ impl<C: Connector> Pool<C> {
 }
 
 impl<C: Connector> Grant<C> {
-    fn into_slot(self) -> Slot<C> {
-        match self {
-            Grant::Slot(slot) => slot,
-            Grant::Conn(..) => unreachable!("a failed send returns what was sent"),
-        }
-    }
-
     fn into_conn(self) -> (C::Conn, Slot<C>) {
         match self {
-            Grant::Conn(conn, slot) => (conn, slot),
-            Grant::Slot(_) => unreachable!("a failed send returns what was sent"),
+            Grant::Conn(conn, slot, _) => (conn, slot),
+            Grant::Failed(_) => unreachable!("a failed send returns what was sent"),
         }
     }
 
-    fn into_obtained(self) -> Obtained<C> {
+    fn into_error(self) -> C::Error {
         match self {
-            Grant::Conn(conn, slot) => Obtained::Granted(conn, slot),
-            Grant::Slot(slot) => Obtained::Slot(slot),
+            Grant::Failed(error) => error,
+            Grant::Conn(..) => unreachable!("a failed send returns what was sent"),
         }
     }
 }
@@ -574,6 +701,10 @@ impl<C: Connector> Shared<C> {
             .values()
             .cloned()
             .collect()
+    }
+
+    fn window(&self) -> u64 {
+        self.epoch.elapsed().as_secs() / Peaks::WINDOW.as_secs()
     }
 
     /// Closes the oldest idle connection, of any pool other than `except`.
@@ -622,6 +753,9 @@ impl<C: Connector> Pools<C> {
                 pools: Mutex::default(),
                 metrics,
                 permit_waiters: AtomicUsize::new(0),
+                holds: Mutex::default(),
+                connect_time: Mutex::default(),
+                epoch: Instant::now(),
             }),
         }
     }
@@ -660,7 +794,14 @@ impl<C: Connector> Pools<C> {
                     state: Mutex::new(State {
                         idle: Vec::new(),
                         open: 0,
+                        opening: 0,
+                        reserved: 0,
                         waiters: VecDeque::new(),
+                        leases: HashMap::new(),
+                        next_lease: 0,
+                        holds: Holds::default(),
+                        peaks: Peaks::default(),
+                        replan_scheduled: false,
                         clients: 0,
                         last_active: Instant::now(),
                     }),
@@ -676,9 +817,22 @@ impl<C: Connector> Pools<C> {
         self.shared.list()
     }
 
-    /// Closes idle connections that expired and drops unused empty pools.
+    /// Closes idle connections that expired or that the pool has not needed lately, ages the
+    /// hold statistics and drops unused empty pools. Run once a second.
     pub fn reap(&self) {
+        let window = self.shared.window();
+        self.shared
+            .holds
+            .lock()
+            .expect("holds poisoned")
+            .decay(demand::DECAY_PER_SECOND);
         for pool in self.shared.list() {
+            pool.lock().holds.decay(demand::DECAY_PER_SECOND);
+            for mut idle in pool.close_surplus(window) {
+                self.shared.metrics.recycle("surplus");
+                self.shared.connector.close(&mut idle.conn);
+                drop(idle);
+            }
             let expired: Vec<(Idle<C>, &'static str)> = {
                 let mut state = pool.lock();
                 let mut expired = Vec::new();
@@ -710,9 +864,10 @@ impl<C: Connector> Pools<C> {
             map.by_key.retain(|_, pool| {
                 let mut state = pool.lock();
                 // A waiter that timed out leaves its sender behind until the next enqueue.
-                state.waiters.retain(|waiter| !waiter.is_closed());
+                state.waiters.retain(|waiter| !waiter.tx.is_closed());
                 let unused = state.clients == 0
                     && state.open == 0
+                    && state.opening == 0
                     && state.waiters.is_empty()
                     && state.last_active.elapsed() >= gc_after;
                 if unused {
@@ -1045,6 +1200,82 @@ mod tests {
             assert!(task.await.unwrap());
         }
         assert_eq!(pools.connector().max_connecting.load(Ordering::SeqCst), 2);
+    }
+
+    /// Leases of `millis` each, one after another, so the pool learns how long its clients hold.
+    async fn teach_holds(pool: &Arc<Pool<FakeConnector>>, millis: u64) {
+        for _ in 0..30 {
+            let lease = pool.acquire(deadline()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            lease.release();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_short_queries_is_served_by_released_connections() {
+        let mut pools = pools(10, 10);
+        Arc::get_mut(&mut pools.shared).unwrap().limits.max_waiters = 16;
+        let pool = pools.register(key("slow")).unwrap();
+        teach_holds(&pool, 1).await;
+        let started = Instant::now();
+        let queries: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let lease = pool.acquire(deadline()).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    lease.release();
+                })
+            })
+            .collect();
+        for query in queries {
+            query.await.unwrap();
+        }
+        // One connection serves all eight sooner than a second one opens (50 ms).
+        assert_eq!(pools.connector().opened.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_millis(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_held_longer_than_usual_does_not_hold_up_the_queue() {
+        let pools = pools(2, 10);
+        let pool = pools.register(key("slow")).unwrap();
+        teach_holds(&pool, 1).await;
+        let _held = pool.acquire(deadline()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        let lease = pool.acquire(deadline()).await.unwrap();
+        assert_eq!(lease.source, Source::New);
+        assert!(started.elapsed() < Duration::from_millis(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_reaper_closes_idle_connections_beyond_the_recent_peak() {
+        let pools = pools(3, 10);
+        let pool = pools.register(key("a")).unwrap();
+        let burst = [
+            pool.acquire(deadline()).await.unwrap(),
+            pool.acquire(deadline()).await.unwrap(),
+            pool.acquire(deadline()).await.unwrap(),
+        ];
+        for lease in burst {
+            lease.release();
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        pools.reap();
+        // The burst is recent: its connections stay.
+        assert_eq!(pool.stats().servers_idle, 3);
+        tokio::time::advance(Duration::from_secs(25)).await;
+        pool.acquire(deadline()).await.unwrap().release();
+        pools.reap();
+        assert_eq!(pool.stats().servers_idle, 1);
+        let surplus = pools
+            .shared
+            .metrics
+            .server_recycles
+            .get_or_create(&crate::metrics::Reason { reason: "surplus" })
+            .get();
+        assert_eq!(surplus, 2);
     }
 
     #[tokio::test(start_paused = true)]

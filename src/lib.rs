@@ -5,6 +5,7 @@ pub mod app;
 pub mod auth;
 pub mod cancel;
 pub mod config;
+pub mod demand;
 pub mod dns;
 pub mod metrics;
 pub mod pool;

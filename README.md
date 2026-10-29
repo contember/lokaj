@@ -160,18 +160,34 @@ transaction. Give the roles read-only privileges for a hard boundary.
   - A client waits at most `pool.wait_timeout`, then gets `53300`.
   - At most `pool.max_connecting` connections are being opened at once, across pools.
   - Opening a connection is retried every 100 ms while the server is starting up (`57P03`),
-    full (`53300`) or unreachable, until `pool.wait_timeout`. The client then gets the last
-    error.
+    full (`53300`) or unreachable, as long as a waiting client's `pool.wait_timeout` allows.
+    The oldest waiting client then gets the last error.
   - Across pools, at most `pool.max_total` connections. When that is full, lokaj closes the
     oldest idle connection of another pool rather than letting a client wait, also when that
     connection goes idle only while the client waits.
+- **Queue.** A client without an idle connection joins the pool's queue; it never opens a
+  connection itself. The first connection available, released by another client or newly
+  opened, goes to the oldest waiter. lokaj opens a connection only for waiters that released
+  connections would not serve within half a connect time:
+  - It keeps a decaying histogram of how long the pool's clients hold a connection, the one of
+    the whole process until the pool has enough of its own, and a moving average of how long a
+    new connection takes to open.
+  - From them it estimates how many current leases end within that time, and how many waiters
+    each freed connection then serves one after another.
+  - A lease that has already run longer than the pool's leases usually do is not counted on,
+    so one slow query does not hold up the queue.
+
+  A burst of 20 queries of 2 ms thus waits a few milliseconds for one or two connections,
+  instead of ~50 ms each for 20 new ones that then sit idle.
 - **Lifecycle.**
-  - No minimum size, and no background connects: a connection is opened only for a waiting
-    client.
+  - No minimum size, and no background connects: connections are opened only while clients
+    wait.
   - Connections close after `server.idle_timeout` idle, or after `server.lifetime` plus random
     jitter.
   - A pool keeps at most `pool.max_idle` idle connections (`pool.max_size` by default), and a
     connection released beyond that is closed.
+  - A pool also keeps no more connections than it had leased at once in the last ~30 s: an idle
+    one beyond that is closed after 5 s idle (`surplus`).
   - Server and client connections use TCP keepalive after `server.keepalive_time`, and
     `TCP_USER_TIMEOUT` closes them when sent data stays unacknowledged for 30 s longer. A peer
     that vanishes mid-query is noticed within about a minute.
@@ -329,6 +345,7 @@ cargo test                              # unit and property tests
 scripts/integration.sh [rust|node]      # PostgreSQL 18 in Docker: protocol suite and node-pg suite
 scripts/chaos.sh                        # primary + hot standby: reader reboot, fallback to the writer, pooler kill, drain
 cpu-lease run -n 6 -- scripts/load.sh   # load test on three reserved SMT pairs
+cargo run --release --example pool_sim  # the pools under a multi-tenant workload, in virtual time
 cargo +nightly fuzz run frontend        # also: startup, sql_guard, backend_stream
 ```
 
