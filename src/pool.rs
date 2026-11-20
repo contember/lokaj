@@ -515,9 +515,16 @@ impl<C: Connector> Pool<C> {
                 .sum();
             let hold = Duration::from_secs_f64(holds.mean());
             let room = self.shared.limits.max_size - (state.open + state.reserved);
-            let opens =
-                demand::opens_needed(waiting, state.opening, ending, hold, connect, patience)
-                    .min(room);
+            let opens = demand::opens_needed(
+                waiting,
+                self.shared.limits.max_waiters,
+                state.opening,
+                ending,
+                hold,
+                connect,
+                patience,
+            )
+            .min(room);
             state.opening += opens;
             state.reserved += opens;
             let replan = waiting > state.opening && !state.replan_scheduled;
@@ -949,7 +956,9 @@ mod tests {
         async fn open(&self, key: &PoolKey, _: &()) -> Result<FakeConn, &'static str> {
             let connecting = self.connecting.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_connecting.fetch_max(connecting, Ordering::SeqCst);
-            if key.user.starts_with("slow") {
+            if key.user.starts_with("sluggish") {
+                tokio::time::sleep(Duration::from_millis(180)).await;
+            } else if key.user.starts_with("slow") {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             } else {
                 tokio::task::yield_now().await;
@@ -1234,6 +1243,103 @@ mod tests {
         // One connection serves all eight sooner than a second one opens (50 ms).
         assert_eq!(pools.connector().opened.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_millis(20));
+    }
+
+    struct Burst {
+        clients: usize,
+        refused: usize,
+        most_open: usize,
+    }
+
+    /// `warm` connections of a pool for `user`, then transactions arriving at the rate they
+    /// serve, rising linearly to twice that over three seconds. Holds take turns at one
+    /// millisecond below, at and above `hold_ms`.
+    async fn burst(user: &str, warm: usize, hold_ms: u64) -> Burst {
+        let hold = |i: usize| Duration::from_millis(hold_ms - 1 + (i % 3) as u64);
+        let limits = Limits {
+            max_size: warm * 5 / 2,
+            max_idle: warm * 5 / 2,
+            max_total: 100,
+            max_waiters: 100,
+            max_connecting: 16,
+            gc_after: Duration::from_secs(300),
+        };
+        let pools = Pools::new(FakeConnector::default(), limits, Arc::new(Metrics::new()));
+        let pool = pools.register(key(user)).unwrap();
+        // The first connection is opened by the pool, so it learns the connect time.
+        pool.acquire(deadline()).await.unwrap().release();
+        let mut conns = Vec::new();
+        for _ in 1..warm {
+            conns.push(pools.connector().open(&pool.key, &()).await.unwrap());
+        }
+        let leases: Vec<_> = conns
+            .into_iter()
+            .map(|conn| pool.try_adopt(conn).unwrap())
+            .collect();
+        tokio::time::sleep(hold(1)).await;
+        leases.into_iter().for_each(Lease::release);
+        for i in 0..100 {
+            let lease = pool.acquire(deadline()).await.unwrap();
+            tokio::time::sleep(hold(i)).await;
+            lease.release();
+        }
+        assert_eq!(pools.open_total(), warm);
+
+        let rate = warm as f64 / (hold_ms as f64 / 1000.0);
+        let refused = Arc::new(AtomicUsize::new(0));
+        let mut clients = tokio::task::JoinSet::new();
+        let mut started = 0;
+        let mut most_open = 0;
+        let mut ticker = tokio::time::interval(Duration::from_millis(1));
+        for millis in 1..=3000u32 {
+            ticker.tick().await;
+            let seconds = f64::from(millis) / 1000.0;
+            let due = (rate * seconds + rate / 6.0 * seconds * seconds) as usize;
+            for i in started..due {
+                let pool = pool.clone();
+                let refused = refused.clone();
+                let hold = hold(i);
+                clients.spawn(async move {
+                    match pool.acquire(deadline()).await {
+                        Ok(lease) => {
+                            tokio::time::sleep(hold).await;
+                            lease.release();
+                        }
+                        Err(AcquireError::TooManyWaiters) => {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                });
+            }
+            started = due;
+            most_open = most_open.max(pools.open_total());
+        }
+        while clients.join_next().await.is_some() {}
+        Burst {
+            clients: started,
+            refused: refused.load(Ordering::SeqCst),
+            most_open,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_nearing_max_waiters_grows_the_pool_despite_a_slow_connect() {
+        // 4 ms holds and a 180 ms connect: 2,500/s rising to 5,000/s.
+        let burst = burst("sluggish", 10, 4).await;
+        assert!(burst.clients > 100);
+        assert_eq!(burst.refused, 0, "of {} clients", burst.clients);
+        // 5,000/s of 4 ms holds keep 20 connections busy.
+        assert!(burst.most_open >= 20, "{}", burst.most_open);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_nearing_max_waiters_grows_the_pool_with_short_holds() {
+        // 2 ms holds and a 50 ms connect: twenty releases are credited with more waiters than
+        // max_waiters, so only the cap on the queue opens connections in time.
+        let burst = burst("slow", 20, 2).await;
+        assert_eq!(burst.refused, 0, "of {} clients", burst.clients);
+        assert!(burst.most_open >= 40, "{}", burst.most_open);
     }
 
     #[tokio::test(start_paused = true)]
