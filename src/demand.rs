@@ -193,8 +193,9 @@ pub fn opens_needed(
 }
 
 /// How long a waiter should wait for a released connection, at most, before one is opened:
-/// half a connect time kept the waits shortest for the fewest new connections in simulation.
-/// Capped, so a slow connect does not let the queue grow longer before connections are opened.
+/// half a connect time kept the waits shortest for the fewest new connections in simulation of
+/// connects up to ~50 ms. Capped there, so a slower connect does not let the queue grow longer
+/// before connections are opened.
 pub fn patience(connect: Duration) -> Duration {
     (connect / 2).min(Duration::from_millis(25))
 }
@@ -282,7 +283,8 @@ mod tests {
 
     #[test]
     fn a_queue_nearing_max_waiters_opens_despite_a_slow_connect() {
-        // Ten 3.9 ms leases serve the queue within the patience, but more clients keep coming.
+        // Ten 3.9 ms leases and a 180 ms connect: half a connect time of patience credited the
+        // releases with ~125 of 99 waiters and opened nothing while more clients kept coming.
         let connect = ms(180.0);
         let opens = opens_needed(99, 100, 0, 10.0, ms(3.9), connect, patience(connect));
         assert!(opens > 0, "{opens}");
