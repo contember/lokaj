@@ -515,9 +515,16 @@ impl<C: Connector> Pool<C> {
                 .sum();
             let hold = Duration::from_secs_f64(holds.mean());
             let room = self.shared.limits.max_size - (state.open + state.reserved);
-            let opens =
-                demand::opens_needed(waiting, state.opening, ending, hold, connect, patience)
-                    .min(room);
+            let opens = demand::opens_needed(
+                waiting,
+                self.shared.limits.max_waiters,
+                state.opening,
+                ending,
+                hold,
+                connect,
+                patience,
+            )
+            .min(room);
             state.opening += opens;
             state.reserved += opens;
             let replan = waiting > state.opening && !state.replan_scheduled;
@@ -949,7 +956,9 @@ mod tests {
         async fn open(&self, key: &PoolKey, _: &()) -> Result<FakeConn, &'static str> {
             let connecting = self.connecting.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_connecting.fetch_max(connecting, Ordering::SeqCst);
-            if key.user.starts_with("slow") {
+            if key.user.starts_with("sluggish") {
+                tokio::time::sleep(Duration::from_millis(180)).await;
+            } else if key.user.starts_with("slow") {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             } else {
                 tokio::task::yield_now().await;
@@ -1234,6 +1243,74 @@ mod tests {
         // One connection serves all eight sooner than a second one opens (50 ms).
         assert_eq!(pools.connector().opened.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_millis(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_nearing_max_waiters_grows_the_pool_despite_a_slow_connect() {
+        let limits = Limits {
+            max_size: 25,
+            max_idle: 25,
+            max_total: 100,
+            max_waiters: 100,
+            max_connecting: 16,
+            gc_after: Duration::from_secs(300),
+        };
+        let pools = Pools::new(FakeConnector::default(), limits, Arc::new(Metrics::new()));
+        let pool = pools.register(key("sluggish")).unwrap();
+        // Ten connections, the first one opened by the pool so it learns the 180 ms connect.
+        pool.acquire(deadline()).await.unwrap().release();
+        let mut conns = Vec::new();
+        for _ in 1..10 {
+            conns.push(pools.connector().open(&pool.key, &()).await.unwrap());
+        }
+        let warm: Vec<_> = conns
+            .into_iter()
+            .map(|conn| pool.try_adopt(conn).unwrap())
+            .collect();
+        tokio::time::sleep(Duration::from_millis(4)).await;
+        warm.into_iter().for_each(Lease::release);
+        for _ in 0..100 {
+            let lease = pool.acquire(deadline()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(4)).await;
+            lease.release();
+        }
+        assert_eq!(pools.open_total(), 10);
+
+        // 4 ms transactions arriving at 2,500/s, what ten connections serve, rising to 5,000/s
+        // over three seconds.
+        let refused = Arc::new(AtomicUsize::new(0));
+        let mut clients = tokio::task::JoinSet::new();
+        let mut started = 0;
+        let mut most_open = 0;
+        let mut ticker = tokio::time::interval(Duration::from_millis(1));
+        for millis in 1..=3000u32 {
+            ticker.tick().await;
+            let seconds = f64::from(millis) / 1000.0;
+            let due = (2500.0 * seconds + 2500.0 / 6.0 * seconds * seconds) as usize;
+            for _ in started..due {
+                let pool = pool.clone();
+                let refused = refused.clone();
+                clients.spawn(async move {
+                    match pool.acquire(deadline()).await {
+                        Ok(lease) => {
+                            tokio::time::sleep(Duration::from_millis(4)).await;
+                            lease.release();
+                        }
+                        Err(AcquireError::TooManyWaiters) => {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                });
+            }
+            started = due;
+            most_open = most_open.max(pools.open_total());
+        }
+        while clients.join_next().await.is_some() {}
+        assert!(started > 100);
+        assert_eq!(refused.load(Ordering::SeqCst), 0, "of {started} clients");
+        // 5,000/s of 4 ms holds keep 20 connections busy.
+        assert!(most_open >= 20, "{most_open}");
     }
 
     #[tokio::test(start_paused = true)]
