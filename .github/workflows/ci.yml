@@ -58,6 +58,7 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz each target for a minute
         run: |
+          # libFuzzer's default per-input timeout (1200 s) outlives the job limit; 30 s reports a hang with its input.
           for target in frontend startup sql_guard backend_stream; do
-            cargo fuzz run "$target" -- -max_total_time=60
+            cargo fuzz run "$target" -- -max_total_time=60 -timeout=30
           done
